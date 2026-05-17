@@ -21,10 +21,27 @@ docker compose up --build
 - Gateway API: http://localhost:8080/v1/chat/completions
 - Backend health: http://localhost:8080/api/health
 
-默认管理员密钥在 `.env` 的 `ADMIN_API_KEY`。管理 API 需要请求头：
+管理后台采用 `JWT + RBAC + IP 白名单`。请在 `.env` 中配置：
+
+```bash
+ADMIN_JWT_SECRET=<base64-encoded 32-byte secret>
+ADMIN_BOOTSTRAP_ADMIN_USERNAME=admin
+ADMIN_BOOTSTRAP_ADMIN_PASSWORD=<strong-password>
+ADMIN_BOOTSTRAP_VIEWER_USERNAME=viewer
+ADMIN_BOOTSTRAP_VIEWER_PASSWORD=<strong-password>
+ADMIN_IP_WHITELIST=127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+```
+
+登录后，管理 API 需要请求头：
 
 ```http
-X-Admin-Key: change-me-admin-key
+Authorization: Bearer <admin-jwt>
+```
+
+`Provider` 的上游 API Key 会使用 `AES-GCM` 加密后存储到数据库。请在 `.env` 中配置：
+
+```bash
+PROVIDER_KEY_ENCRYPTION_KEY=<base64-encoded 32-byte key>
 ```
 
 用户调用网关需要请求头：
@@ -53,6 +70,8 @@ curl -N http://localhost:8080/v1/chat/completions \
 ## MVP Coverage
 
 - API key authentication with hash-at-rest
+- Admin login with JWT session and RBAC (`ADMIN`, `VIEWER`)
+- Admin IP allow-list check
 - Admin APIs for users, gateway API keys, provider keys, usage summary, audit logs
 - Region allow-list check
 - Redis fixed-window rate limiting
@@ -67,6 +86,9 @@ curl -N http://localhost:8080/v1/chat/completions \
 ## Production Notes
 
 - Replace demo keys and `ADMIN_API_KEY`.
+- Set strong admin bootstrap passwords and rotate them regularly.
+- Narrow `ADMIN_IP_WHITELIST` to office/VPN egress IPs only.
+- Set a strong `PROVIDER_KEY_ENCRYPTION_KEY` and rotate keys if this value is changed.
 - Terminate HTTPS with Caddy or managed load balancer.
 - Restrict admin routes with SSO/VPN in production.
 - Store provider keys in a KMS-backed secret store if compliance requires it.

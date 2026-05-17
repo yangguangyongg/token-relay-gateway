@@ -20,6 +20,14 @@ spring:
 
 gateway:
   admin-api-key: ${ADMIN_API_KEY:change-me-admin-key}
+  admin-jwt-secret: ${ADMIN_JWT_SECRET:REPLACE_WITH_32_BYTE_BASE64_JWT_SECRET}
+  admin-jwt-ttl-seconds: ${ADMIN_JWT_TTL_SECONDS:3600}
+  admin-bootstrap-admin-username: ${ADMIN_BOOTSTRAP_ADMIN_USERNAME:admin}
+  admin-bootstrap-admin-password: ${ADMIN_BOOTSTRAP_ADMIN_PASSWORD:change-me-admin-password}
+  admin-bootstrap-viewer-username: ${ADMIN_BOOTSTRAP_VIEWER_USERNAME:viewer}
+  admin-bootstrap-viewer-password: ${ADMIN_BOOTSTRAP_VIEWER_PASSWORD:change-me-viewer-password}
+  admin-ip-whitelist: ${ADMIN_IP_WHITELIST:127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
   allowed-regions: ${ALLOWED_REGIONS:NZ,AU,US,CA,GB,IE,JP,KR,SG,IN,DE,FR,NL,SE,NO,DK,FI}
   cors-allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173,http://localhost:8080}
   default-provider-timeout-seconds: 120
+  provider-key-encryption-key: ${PROVIDER_KEY_ENCRYPTION_KEY:REPLACE_WITH_32_BYTE_BASE64_KEY}

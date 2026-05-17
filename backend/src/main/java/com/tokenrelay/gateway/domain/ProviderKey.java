@@ -15,4 +15,8 @@ public record ProviderKey(
     String azureDeployment,
     String status,
     int priority,
-    Instant createdAt) {}
+    Instant createdAt) {
+  public ProviderKey withApiKey(String nextApiKey) {
+    return new ProviderKey(id, provider, name, baseUrl, nextApiKey, azureDeployment, status, priority, createdAt);
+  }
+}

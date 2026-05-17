@@ -45,14 +45,25 @@ type AuditLog = {
   createdAt: string;
 };
 
-const api = async <T,>(path: string, adminKey: string, options: RequestInit = {}): Promise<T> => {
+type LoginResponse = {
+  accessToken: string;
+  tokenType: string;
+  expiresInSeconds: number;
+  username: string;
+  roles: string[];
+};
+
+const api = async <T,>(path: string, adminToken?: string, options: RequestInit = {}): Promise<T> => {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(options.headers as Record<string, string> | undefined)
+  };
+  if (adminToken) {
+    headers.Authorization = `Bearer ${adminToken}`;
+  }
   const response = await fetch(path, {
     ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Admin-Key': adminKey,
-      ...(options.headers ?? {})
-    }
+    headers
   });
   if (!response.ok) {
     const body = await response.text();
@@ -62,7 +73,11 @@ const api = async <T,>(path: string, adminKey: string, options: RequestInit = {}
 };
 
 function App() {
-  const [adminKey, setAdminKey] = useState(localStorage.getItem('adminKey') ?? 'change-me-admin-key');
+  const [username, setUsername] = useState('admin');
+  const [password, setPassword] = useState('');
+  const [adminToken, setAdminToken] = useState('');
+  const [adminName, setAdminName] = useState('');
+  const [adminRoles, setAdminRoles] = useState<string[]>([]);
   const [users, setUsers] = useState<User[]>([]);
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
   const [providerKeys, setProviderKeys] = useState<ProviderKey[]>([]);
@@ -80,16 +95,20 @@ function App() {
     };
   }, [users, apiKeys, providerKeys, usage]);
 
-  const load = async () => {
-    localStorage.setItem('adminKey', adminKey);
+  const load = async (tokenOverride?: string) => {
+    const token = tokenOverride ?? adminToken;
+    if (!token) {
+      setMessage('Please login to access admin APIs');
+      return;
+    }
     setMessage('Loading...');
     try {
       const [loadedUsers, loadedApiKeys, loadedProviders, loadedUsage, loadedAuditLogs] = await Promise.all([
-        api<User[]>('/api/admin/users', adminKey),
-        api<ApiKey[]>('/api/admin/api-keys', adminKey),
-        api<ProviderKey[]>('/api/admin/provider-keys', adminKey),
-        api<UsageRow[]>('/api/admin/usage-summary', adminKey),
-        api<AuditLog[]>('/api/admin/audit-logs', adminKey)
+        api<User[]>('/api/admin/users', token),
+        api<ApiKey[]>('/api/admin/api-keys', token),
+        api<ProviderKey[]>('/api/admin/provider-keys', token),
+        api<UsageRow[]>('/api/admin/usage-summary', token),
+        api<AuditLog[]>('/api/admin/audit-logs', token)
       ]);
       setUsers(loadedUsers);
       setApiKeys(loadedApiKeys);
@@ -103,13 +122,46 @@ function App() {
   };
 
   useEffect(() => {
-    load();
+    setMessage('Please login to access admin APIs');
   }, []);
+
+  const login = async () => {
+    setMessage('Signing in...');
+    try {
+      const response = await api<LoginResponse>('/api/admin/auth/login', undefined, {
+        method: 'POST',
+        body: JSON.stringify({
+          username,
+          password
+        })
+      });
+      setAdminToken(response.accessToken);
+      setAdminName(response.username);
+      setAdminRoles(response.roles);
+      setPassword('');
+      await load(response.accessToken);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Login failed');
+    }
+  };
+
+  const logout = () => {
+    setAdminToken('');
+    setAdminName('');
+    setAdminRoles([]);
+    setUsers([]);
+    setApiKeys([]);
+    setProviderKeys([]);
+    setUsage([]);
+    setAuditLogs([]);
+    setRawKey('');
+    setMessage('Logged out');
+  };
 
   const createUser = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    await api('/api/admin/users', adminKey, {
+    await api('/api/admin/users', adminToken, {
       method: 'POST',
       body: JSON.stringify({
         email: form.get('email'),
@@ -124,7 +176,7 @@ function App() {
   const createApiKey = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    const response = await api<{ rawKey: string }>('/api/admin/api-keys', adminKey, {
+    const response = await api<{ rawKey: string }>('/api/admin/api-keys', adminToken, {
       method: 'POST',
       body: JSON.stringify({
         userId: form.get('userId'),
@@ -140,7 +192,7 @@ function App() {
   const createProvider = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    await api('/api/admin/provider-keys', adminKey, {
+    await api('/api/admin/provider-keys', adminToken, {
       method: 'POST',
       body: JSON.stringify({
         provider: form.get('provider'),
@@ -164,10 +216,37 @@ function App() {
         </div>
         <div className="admin-key">
           <Shield size={18} />
-          <input value={adminKey} onChange={(event) => setAdminKey(event.target.value)} aria-label="Admin API key" />
-          <button onClick={load} title="Refresh dashboard">
-            <RefreshCw size={18} />
-          </button>
+          {!adminToken && (
+            <>
+              <input
+                value={username}
+                onChange={(event) => setUsername(event.target.value)}
+                aria-label="Admin username"
+                placeholder="Username"
+              />
+              <input
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                aria-label="Admin password"
+                type="password"
+                placeholder="Password"
+              />
+              <button onClick={login} title="Sign in">
+                Sign in
+              </button>
+            </>
+          )}
+          {adminToken && (
+            <>
+              <span>{adminName} ({adminRoles.join(',')})</span>
+              <button onClick={() => load()} title="Refresh dashboard">
+                <RefreshCw size={18} />
+              </button>
+              <button onClick={logout} title="Sign out">
+                Sign out
+              </button>
+            </>
+          )}
         </div>
       </header>
 

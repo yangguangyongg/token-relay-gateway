@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.tokenrelay.gateway.adapter.ProviderAdapter;
 import com.tokenrelay.gateway.domain.ProviderKey;
 import com.tokenrelay.gateway.repository.ProviderKeyRepository;
+import com.tokenrelay.gateway.service.ProviderKeySecurityService;
 import java.util.Comparator;
 import java.util.List;
 import org.springframework.stereotype.Service;
@@ -13,14 +14,20 @@ import reactor.core.publisher.Mono;
 public class ProviderRouter {
   private final ProviderKeyRepository providerKeys;
   private final List<ProviderAdapter> adapters;
+  private final ProviderKeySecurityService providerKeySecurity;
 
-  public ProviderRouter(ProviderKeyRepository providerKeys, List<ProviderAdapter> adapters) {
+  public ProviderRouter(
+      ProviderKeyRepository providerKeys,
+      List<ProviderAdapter> adapters,
+      ProviderKeySecurityService providerKeySecurity) {
     this.providerKeys = providerKeys;
     this.adapters = adapters;
+    this.providerKeySecurity = providerKeySecurity;
   }
 
   public Mono<List<RouteCandidate>> candidates(JsonNode request) {
     return providerKeys.findByStatusOrderByPriorityAsc("ACTIVE")
+        .map(providerKeySecurity::decryptForRuntime)
         .flatMap(key -> adapterFor(key, request).map(adapter -> new RouteCandidate(key, adapter)))
         .sort(Comparator.comparingInt(candidate -> routeScore(candidate.providerKey(), request)))
         .collectList();
