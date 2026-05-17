@@ -1,0 +1,8 @@
+:443 {
+  tls internal
+  reverse_proxy /api/* backend:8080
+  reverse_proxy /v1/* backend:8080 {
+    flush_interval -1
+  }
+  reverse_proxy frontend:80
+}
