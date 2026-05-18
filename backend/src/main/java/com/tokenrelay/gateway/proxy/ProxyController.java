@@ -6,12 +6,16 @@ import com.tokenrelay.gateway.auth.AuthContext;
 import com.tokenrelay.gateway.domain.UsageEvent;
 import com.tokenrelay.gateway.repository.UsageEventRepository;
 import com.tokenrelay.gateway.service.AuthService;
+import com.tokenrelay.gateway.service.BillingControlService;
 import com.tokenrelay.gateway.service.ComplianceService;
 import com.tokenrelay.gateway.service.GatewayException;
+import com.tokenrelay.gateway.service.ModelPricingService;
 import com.tokenrelay.gateway.service.QuotaService;
 import com.tokenrelay.gateway.service.RateLimitService;
-import java.util.List;
+import com.tokenrelay.gateway.service.UsageMeteringService;
 import java.util.UUID;
+import java.math.BigDecimal;
+import java.util.List;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -31,6 +35,9 @@ public class ProxyController {
   private final QuotaService quotaService;
   private final ProviderRouter router;
   private final UsageEventRepository usageEvents;
+  private final UsageMeteringService usageMeteringService;
+  private final ModelPricingService modelPricingService;
+  private final BillingControlService billingControlService;
   private final ObjectMapper objectMapper;
 
   public ProxyController(
@@ -40,6 +47,9 @@ public class ProxyController {
       QuotaService quotaService,
       ProviderRouter router,
       UsageEventRepository usageEvents,
+      UsageMeteringService usageMeteringService,
+      ModelPricingService modelPricingService,
+      BillingControlService billingControlService,
       ObjectMapper objectMapper) {
     this.authService = authService;
     this.complianceService = complianceService;
@@ -47,6 +57,9 @@ public class ProxyController {
     this.quotaService = quotaService;
     this.router = router;
     this.usageEvents = usageEvents;
+    this.usageMeteringService = usageMeteringService;
+    this.modelPricingService = modelPricingService;
+    this.billingControlService = billingControlService;
     this.objectMapper = objectMapper;
   }
 
@@ -76,10 +89,12 @@ public class ProxyController {
       List<ProviderRouter.RouteCandidate> candidates,
       int index) {
     ProviderRouter.RouteCandidate candidate = candidates.get(index);
+    UsageMeteringService.UsageTracker usageTracker = usageMeteringService.newTracker(candidate.providerKey().provider(), request);
     return candidate.adapter().stream(candidate.providerKey(), request)
         .map(response -> {
           Flux<String> body = response.getBody()
-              .doFinally(signal -> saveUsage(context, candidate, request, response.getStatusCode().value(), requestId).subscribe());
+              .doOnNext(usageTracker::onChunk)
+              .doFinally(signal -> saveUsage(context, candidate, request, response.getStatusCode().value(), requestId, usageTracker).subscribe());
           return ResponseEntity.status(response.getStatusCode())
               .header("X-Request-Id", requestId)
               .header("X-Provider", candidate.providerKey().provider())
@@ -99,27 +114,35 @@ public class ProxyController {
       ProviderRouter.RouteCandidate candidate,
       JsonNode request,
       int statusCode,
-      String requestId) {
-    long promptTokens = estimateTokens(request.path("messages").toString());
-    long completionTokens = 0;
-    long totalTokens = promptTokens + completionTokens;
-    UsageEvent event = new UsageEvent(
-        null,
-        context.user().id(),
-        context.apiKey().id(),
-        candidate.providerKey().provider(),
-        request.path("model").asText("unknown"),
-        promptTokens,
-        completionTokens,
-        totalTokens,
-        statusCode,
-        requestId,
-        null);
-    return usageEvents.save(event).then();
-  }
-
-  private long estimateTokens(String text) {
-    return Math.max(1, text.length() / 4);
+      String requestId,
+      UsageMeteringService.UsageTracker usageTracker) {
+    UsageMeteringService.UsageSnapshot usage = usageTracker.snapshot();
+    String model = request.path("model").asText("unknown");
+    return modelPricingService.resolve(candidate.providerKey().provider(), model)
+        .flatMap(pricing -> {
+          BigDecimal estimatedCost = modelPricingService.estimateCost(pricing, usage.promptTokens(), usage.completionTokens());
+          UsageEvent event = new UsageEvent(
+              null,
+              context.user().id(),
+              context.apiKey().id(),
+              candidate.providerKey().provider(),
+              model,
+              usage.promptTokens(),
+              usage.completionTokens(),
+              usage.totalTokens(),
+              usage.promptTokens(),
+              usage.completionTokens(),
+              estimatedCost,
+              pricing.pricingRuleId(),
+              "DRAFT",
+              null,
+              statusCode,
+              requestId,
+              null);
+          return usageEvents.save(event)
+              .flatMap(saved -> billingControlService.evaluate(saved.userId(), estimatedCost, requestId))
+              .then();
+        });
   }
 
   @ExceptionHandler(GatewayException.class)

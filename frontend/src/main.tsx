@@ -34,6 +34,7 @@ type UsageRow = {
   model: string;
   requests: number;
   total_tokens: number;
+  total_cost_usd: number;
 };
 
 type AuditLog = {
@@ -55,7 +56,47 @@ type UsageDetailRow = {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  total_cost_usd: number;
+  billing_status: string;
   last_request_at: string;
+};
+
+type ModelPricing = {
+  id: string;
+  provider: string;
+  modelPattern: string;
+  currency: string;
+  promptPricePer1mTokens: number;
+  completionPricePer1mTokens: number;
+  status: string;
+  effectiveFrom: string;
+};
+
+type BillingPolicy = {
+  userId: string;
+  currency: string;
+  monthlyBudgetUsd: number;
+  alertThresholdPercent: number;
+  autoDisableApiKeys: boolean;
+  webhookUrl: string | null;
+  status: string;
+};
+
+type MonthlyBill = {
+  bill_id: string;
+  bill_month: string;
+  status: string;
+  currency: string;
+  total_requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  total_cost_usd: number;
+  sent_at: string | null;
+  paid_at: string | null;
+  user_id: string;
+  user_email: string;
+  user_name: string;
 };
 
 type LoginResponse = {
@@ -85,6 +126,8 @@ const billingCsvPath = (month: string, userId: string) => {
   }
   return `/api/admin/billing/monthly.csv?${params.toString()}`;
 };
+
+const billsPath = (month: string) => `/api/admin/bills?month=${encodeURIComponent(month)}`;
 
 const parseDownloadFileName = (contentDisposition: string | null, fallback: string) => {
   if (!contentDisposition) {
@@ -130,6 +173,10 @@ function App() {
   const [usageDetails, setUsageDetails] = useState<UsageDetailRow[]>([]);
   const [usageMonth, setUsageMonth] = useState(currentMonthValue());
   const [usageUserId, setUsageUserId] = useState('');
+  const [billMonth, setBillMonth] = useState(currentMonthValue());
+  const [pricingModels, setPricingModels] = useState<ModelPricing[]>([]);
+  const [billingPolicies, setBillingPolicies] = useState<BillingPolicy[]>([]);
+  const [monthlyBills, setMonthlyBills] = useState<MonthlyBill[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [message, setMessage] = useState('');
   const [rawKey, setRawKey] = useState('');
@@ -151,12 +198,25 @@ function App() {
     }
     setMessage('Loading...');
     try {
-      const [loadedUsers, loadedApiKeys, loadedProviders, loadedUsage, loadedUsageDetails, loadedAuditLogs] = await Promise.all([
+      const [
+        loadedUsers,
+        loadedApiKeys,
+        loadedProviders,
+        loadedUsage,
+        loadedUsageDetails,
+        loadedPricingModels,
+        loadedBillingPolicies,
+        loadedMonthlyBills,
+        loadedAuditLogs
+      ] = await Promise.all([
         api<User[]>('/api/admin/users', token),
         api<ApiKey[]>('/api/admin/api-keys', token),
         api<ProviderKey[]>('/api/admin/provider-keys', token),
         api<UsageRow[]>('/api/admin/usage-summary', token),
         api<UsageDetailRow[]>(usageDetailsPath(usageMonth, usageUserId), token),
+        api<ModelPricing[]>('/api/admin/pricing/models', token),
+        api<BillingPolicy[]>('/api/admin/billing/policies', token),
+        api<MonthlyBill[]>(billsPath(billMonth), token),
         api<AuditLog[]>('/api/admin/audit-logs', token)
       ]);
       setUsers(loadedUsers);
@@ -164,6 +224,9 @@ function App() {
       setProviderKeys(loadedProviders);
       setUsage(loadedUsage);
       setUsageDetails(loadedUsageDetails);
+      setPricingModels(loadedPricingModels);
+      setBillingPolicies(loadedBillingPolicies);
+      setMonthlyBills(loadedMonthlyBills);
       setAuditLogs(loadedAuditLogs);
       setMessage('Ready');
     } catch (error) {
@@ -204,6 +267,9 @@ function App() {
     setProviderKeys([]);
     setUsage([]);
     setUsageDetails([]);
+    setPricingModels([]);
+    setBillingPolicies([]);
+    setMonthlyBills([]);
     setAuditLogs([]);
     setRawKey('');
     setMessage('Logged out');
@@ -255,6 +321,63 @@ function App() {
       })
     });
     event.currentTarget.reset();
+    await load();
+  };
+
+  const createPricingModel = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    await api('/api/admin/pricing/models', adminToken, {
+      method: 'POST',
+      body: JSON.stringify({
+        provider: form.get('provider'),
+        modelPattern: form.get('modelPattern'),
+        promptPricePer1mTokens: Number(form.get('promptPricePer1mTokens')),
+        completionPricePer1mTokens: Number(form.get('completionPricePer1mTokens'))
+      })
+    });
+    event.currentTarget.reset();
+    await load();
+  };
+
+  const saveBillingPolicy = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    await api('/api/admin/billing/policies', adminToken, {
+      method: 'POST',
+      body: JSON.stringify({
+        userId: form.get('userId'),
+        monthlyBudgetUsd: Number(form.get('monthlyBudgetUsd')),
+        alertThresholdPercent: Number(form.get('alertThresholdPercent')),
+        autoDisableApiKeys: form.get('autoDisableApiKeys') === 'on',
+        webhookUrl: (form.get('webhookUrl') || '').toString() || null
+      })
+    });
+    await load();
+  };
+
+  const generateMonthlyBills = async () => {
+    await api(`/api/admin/bills/generate?month=${encodeURIComponent(billMonth)}`, adminToken, {
+      method: 'POST'
+    });
+    await load();
+  };
+
+  const updateBillStatus = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const billId = (form.get('billId') || '').toString();
+    if (!billId) {
+      setMessage('Select a bill to update status');
+      return;
+    }
+    await api(`/api/admin/bills/${encodeURIComponent(billId)}/status`, adminToken, {
+      method: 'POST',
+      body: JSON.stringify({
+        status: form.get('status'),
+        note: (form.get('note') || '').toString() || null
+      })
+    });
     await load();
   };
 
@@ -395,7 +518,7 @@ function App() {
         </Panel>
 
         <Panel title="Usage" icon={<BarChart3 />}>
-          <Table rows={usage} columns={['provider', 'model', 'requests', 'total_tokens']} />
+          <Table rows={usage} columns={['provider', 'model', 'requests', 'total_tokens', 'total_cost_usd']} />
         </Panel>
 
         <Panel title="User Usage Details" icon={<BarChart3 />}>
@@ -421,8 +544,74 @@ function App() {
           </form>
           <Table
             rows={usageDetails}
-            columns={['user_email', 'provider', 'model', 'requests', 'prompt_tokens', 'completion_tokens', 'total_tokens', 'last_request_at']}
+            columns={['user_email', 'provider', 'model', 'requests', 'prompt_tokens', 'completion_tokens', 'total_tokens', 'total_cost_usd', 'billing_status', 'last_request_at']}
           />
+        </Panel>
+
+        <Panel title="Model Pricing" icon={<Database />}>
+          <form onSubmit={createPricingModel} className="form pricing-form">
+            <select name="provider" required>
+              <option>OPENAI</option>
+              <option>ANTHROPIC</option>
+              <option>AZURE_OPENAI</option>
+              <option>GEMINI</option>
+            </select>
+            <input name="modelPattern" placeholder="model pattern, e.g. gpt-4o-mini or gpt-4o*" required />
+            <input name="promptPricePer1mTokens" type="number" step="0.00000001" min="0" placeholder="Prompt price / 1M" required />
+            <input name="completionPricePer1mTokens" type="number" step="0.00000001" min="0" placeholder="Completion price / 1M" required />
+            <button type="submit"><Plus size={16} /> Add pricing rule</button>
+          </form>
+          <Table rows={pricingModels} columns={['provider', 'modelPattern', 'promptPricePer1mTokens', 'completionPricePer1mTokens', 'status', 'effectiveFrom']} />
+        </Panel>
+
+        <Panel title="Billing Policies" icon={<Shield />}>
+          <form onSubmit={saveBillingPolicy} className="form policy-form">
+            <select name="userId" required>
+              <option value="">Select user</option>
+              {users.map((user) => <option key={user.id} value={user.id}>{user.email}</option>)}
+            </select>
+            <input name="monthlyBudgetUsd" type="number" step="0.00000001" min="0" placeholder="Monthly budget USD" required />
+            <input name="alertThresholdPercent" type="number" step="0.01" min="1" max="100" defaultValue="80" required />
+            <label className="checkbox-field">
+              <input name="autoDisableApiKeys" type="checkbox" />
+              <span>Auto-disable keys when budget exceeded</span>
+            </label>
+            <input name="webhookUrl" placeholder="Webhook URL (optional)" />
+            <button type="submit"><Plus size={16} /> Save policy</button>
+          </form>
+          <Table rows={billingPolicies} columns={['userId', 'monthlyBudgetUsd', 'alertThresholdPercent', 'autoDisableApiKeys', 'webhookUrl', 'status']} />
+        </Panel>
+
+        <Panel title="Monthly Bills" icon={<BarChart3 />}>
+          <form className="form bills-toolbar" onSubmit={(event) => { event.preventDefault(); void load(); }}>
+            <input type="month" value={billMonth} onChange={(event) => setBillMonth(event.target.value)} required />
+            <button type="button" onClick={generateMonthlyBills}>
+              <RefreshCw size={16} />
+              Generate Draft Bills
+            </button>
+            <button type="submit">
+              <RefreshCw size={16} />
+              Refresh Bills
+            </button>
+          </form>
+          <form onSubmit={updateBillStatus} className="form bill-status-form">
+            <select name="billId" required>
+              <option value="">Select bill</option>
+              {monthlyBills.map((bill) => (
+                <option key={bill.bill_id} value={bill.bill_id}>
+                  {bill.user_email} / {bill.bill_month} / {bill.status}
+                </option>
+              ))}
+            </select>
+            <select name="status" required defaultValue="CONFIRMED">
+              <option>CONFIRMED</option>
+              <option>SENT</option>
+              <option>PAID</option>
+            </select>
+            <input name="note" placeholder="Status note (optional)" />
+            <button type="submit"><Plus size={16} /> Update bill status</button>
+          </form>
+          <Table rows={monthlyBills} columns={['user_email', 'bill_month', 'status', 'total_requests', 'total_tokens', 'total_cost_usd', 'sent_at', 'paid_at']} />
         </Panel>
 
         <Panel title="Audit" icon={<Activity />}>

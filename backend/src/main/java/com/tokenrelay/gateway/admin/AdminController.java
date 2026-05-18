@@ -90,6 +90,15 @@ public class AdminController {
     String actor = currentAdmin(exchange).username();
     GatewayUser user = new GatewayUser(null, request.email(), request.displayName(), "ACTIVE", request.monthlyTokenQuota(), null);
     return users.save(user)
+        .flatMap(saved -> databaseClient.sql("""
+            INSERT INTO user_billing_policies (user_id, currency, monthly_budget_usd, alert_threshold_percent, auto_disable_api_keys, status)
+            VALUES (:user_id, 'USD', 0, 80, false, 'ACTIVE')
+            ON CONFLICT (user_id) DO NOTHING
+            """)
+            .bind("user_id", saved.id())
+            .fetch()
+            .rowsUpdated()
+            .thenReturn(saved))
         .flatMap(saved -> auditService.log(actor, "CREATE_USER", saved.id().toString(), saved.email()).thenReturn(saved));
   }
 
@@ -152,7 +161,12 @@ public class AdminController {
   @GetMapping("/admin/usage-summary")
   public Flux<Map<String, Object>> usageSummary(ServerWebExchange exchange) {
     return databaseClient.sql("""
-        SELECT provider, model, count(*) AS requests, coalesce(sum(total_tokens), 0) AS total_tokens
+        SELECT
+          provider,
+          model,
+          count(*) AS requests,
+          coalesce(sum(total_tokens), 0) AS total_tokens,
+          coalesce(sum(estimated_cost_usd), 0) AS total_cost_usd
         FROM usage_events
         GROUP BY provider, model
         ORDER BY requests DESC
@@ -214,6 +228,8 @@ public class AdminController {
           coalesce(sum(ue.prompt_tokens), 0) AS prompt_tokens,
           coalesce(sum(ue.completion_tokens), 0) AS completion_tokens,
           coalesce(sum(ue.total_tokens), 0) AS total_tokens,
+          coalesce(sum(ue.estimated_cost_usd), 0) AS total_cost_usd,
+          max(ue.billing_status) AS billing_status,
           max(ue.created_at) AS last_request_at
         FROM usage_events ue
         JOIN gateway_users u ON u.id = ue.user_id
@@ -263,7 +279,7 @@ public class AdminController {
 
   private String toBillingCsv(YearMonth month, List<Map<String, Object>> rows) {
     StringBuilder csv = new StringBuilder();
-    csv.append("month,user_id,user_email,user_name,provider,model,requests,prompt_tokens,completion_tokens,total_tokens,last_request_at\n");
+    csv.append("month,user_id,user_email,user_name,provider,model,requests,prompt_tokens,completion_tokens,total_tokens,total_cost_usd,billing_status,last_request_at\n");
     for (Map<String, Object> row : rows) {
       csv.append(csvCell(month.toString())).append(",");
       csv.append(csvCell(stringValue(row.get("user_id")))).append(",");
@@ -275,19 +291,22 @@ public class AdminController {
       csv.append(csvCell(stringValue(row.get("prompt_tokens")))).append(",");
       csv.append(csvCell(stringValue(row.get("completion_tokens")))).append(",");
       csv.append(csvCell(stringValue(row.get("total_tokens")))).append(",");
+      csv.append(csvCell(stringValue(row.get("total_cost_usd")))).append(",");
+      csv.append(csvCell(stringValue(row.get("billing_status")))).append(",");
       csv.append(csvCell(stringValue(row.get("last_request_at")))).append("\n");
     }
 
     if (!rows.isEmpty()) {
       csv.append("\n");
-      csv.append("month,user_id,user_email,user_name,total_requests,total_tokens\n");
+      csv.append("month,user_id,user_email,user_name,total_requests,total_tokens,total_cost_usd\n");
       for (Map<String, Object> summary : summarizeByUser(rows)) {
         csv.append(csvCell(month.toString())).append(",");
         csv.append(csvCell(stringValue(summary.get("user_id")))).append(",");
         csv.append(csvCell(stringValue(summary.get("user_email")))).append(",");
         csv.append(csvCell(stringValue(summary.get("user_name")))).append(",");
         csv.append(csvCell(stringValue(summary.get("requests")))).append(",");
-        csv.append(csvCell(stringValue(summary.get("total_tokens")))).append("\n");
+        csv.append(csvCell(stringValue(summary.get("total_tokens")))).append(",");
+        csv.append(csvCell(stringValue(summary.get("total_cost_usd")))).append("\n");
       }
     }
 
@@ -295,7 +314,7 @@ public class AdminController {
   }
 
   private List<Map<String, Object>> summarizeByUser(List<Map<String, Object>> rows) {
-    record UserAgg(String userId, String userEmail, String userName, long requests, long totalTokens) {}
+    record UserAgg(String userId, String userEmail, String userName, long requests, long totalTokens, java.math.BigDecimal totalCostUsd) {}
     Map<String, UserAgg> accumulator = new java.util.LinkedHashMap<>();
     for (Map<String, Object> row : rows) {
       String userId = stringValue(row.get("user_id"));
@@ -303,17 +322,19 @@ public class AdminController {
       String userName = stringValue(row.get("user_name"));
       long requests = longValue(row.get("requests"));
       long totalTokens = longValue(row.get("total_tokens"));
+      java.math.BigDecimal totalCost = decimalValue(row.get("total_cost_usd"));
       String key = userId + "|" + userEmail;
       UserAgg existing = accumulator.get(key);
       if (existing == null) {
-        accumulator.put(key, new UserAgg(userId, userEmail, userName, requests, totalTokens));
+        accumulator.put(key, new UserAgg(userId, userEmail, userName, requests, totalTokens, totalCost));
       } else {
         accumulator.put(key, new UserAgg(
             existing.userId(),
             existing.userEmail(),
             existing.userName(),
             existing.requests() + requests,
-            existing.totalTokens() + totalTokens));
+            existing.totalTokens() + totalTokens,
+            existing.totalCostUsd().add(totalCost)));
       }
     }
 
@@ -324,7 +345,8 @@ public class AdminController {
           "user_email", value.userEmail(),
           "user_name", value.userName(),
           "requests", value.requests(),
-          "total_tokens", value.totalTokens()));
+          "total_tokens", value.totalTokens(),
+          "total_cost_usd", value.totalCostUsd()));
     }
     return summarized;
   }
@@ -345,6 +367,16 @@ public class AdminController {
 
   private String stringValue(Object value) {
     return value == null ? "" : value.toString();
+  }
+
+  private java.math.BigDecimal decimalValue(Object value) {
+    if (value == null) {
+      return java.math.BigDecimal.ZERO;
+    }
+    if (value instanceof java.math.BigDecimal decimal) {
+      return decimal;
+    }
+    return new java.math.BigDecimal(value.toString());
   }
 
   private String csvCell(String value) {

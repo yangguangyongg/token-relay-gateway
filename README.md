@@ -73,6 +73,10 @@ curl -N http://localhost:8080/v1/chat/completions \
 - Admin login with JWT session and RBAC (`ADMIN`, `VIEWER`)
 - Admin IP allow-list check
 - Admin APIs for users, gateway API keys, provider keys, usage summary, audit logs
+- Real token metering from provider usage fields (with fallback estimation)
+- Model pricing table and per-request estimated cost accounting
+- Monthly billing lifecycle (`DRAFT`, `CONFIRMED`, `SENT`, `PAID`) and CSV export
+- User billing policies (budget threshold alert, optional API key auto-disable, webhook callback)
 - Region allow-list check
 - Redis fixed-window rate limiting
 - Monthly token quota reservation and usage counters
@@ -93,3 +97,13 @@ curl -N http://localhost:8080/v1/chat/completions \
 - Restrict admin routes with SSO/VPN in production.
 - Store provider keys in a KMS-backed secret store if compliance requires it.
 - Add legal terms that require callers to be in provider-supported regions and to comply with provider policies.
+
+## Historical Usage Backfill
+
+如果你是从旧版本升级，并希望把历史 `usage_events` 补齐 `billable_*`、`pricing_rule_id` 和 `estimated_cost_usd`，可执行：
+
+```bash
+docker compose exec -T postgres psql -U ${POSTGRES_USER:-token_gateway} -d ${POSTGRES_DB:-token_gateway} -f /dev/stdin < scripts/backfill_usage_events_billing.sql
+```
+
+该脚本是幂等的，可重复执行。
