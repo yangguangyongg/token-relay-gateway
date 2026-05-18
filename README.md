@@ -67,6 +67,57 @@ curl -N http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+## 新用户接入流程（SOP）
+
+下面是当前版本可直接执行的一套接入流程，适用于你新增一个客户/团队成员。
+
+1. 管理员登录后台  
+   打开 `http://localhost:8080`，使用 `.env` 里的管理员账号登录。
+
+2. 创建用户  
+   在 `Users` 面板创建用户，填写：
+   - `email`
+   - `displayName`
+   - `monthlyTokenQuota`（该用户每月 token 配额）
+
+3. 为用户创建网关密钥  
+   在 `Gateway API Keys` 面板：
+   - 选择用户
+   - 设置 `name`
+   - 设置 `rateLimitPerMinute`
+   - 点击创建后会返回一次明文 key（前缀通常为 `tg_`）  
+   注意：该明文只在创建当下返回一次，请立即保存给用户。
+
+4. 配置上游 Provider（平台代付或统一出口）  
+   在 `Provider Keys` 面板至少添加一条可用 provider：
+   - `provider`: `OPENAI` / `ANTHROPIC` / `AZURE_OPENAI` / `GEMINI`
+   - `baseUrl`: 例如 OpenAI 用 `https://api.openai.com`
+   - `apiKey`: 对应 provider 的密钥
+   - `priority`: 路由优先级（数字越小越优先）
+
+5. （建议）配置价格与账单策略  
+   - 在 `Model Pricing` 里确认目标模型有价格规则（否则成本会记为 0）。
+   - 在 `Billing Policies` 里设置用户预算、告警阈值、是否超预算自动停用。
+
+6. 把调用方式发给用户  
+   用户通过以下网关入口调用：
+   - URL: `http://localhost:8080/v1/chat/completions`
+   - Header:
+     - `Authorization: Bearer <gateway-api-key>`
+     - `X-Client-Region: <country-code>`（如 `NZ`）
+   - Body:
+     - `model` 建议与 provider 匹配（如 OpenAI 用 `gpt-*`，Anthropic 用 `claude-*`，Gemini 用 `gemini-*`）
+
+7. 验证是否接入成功  
+   - `Usage` / `User Usage Details` 看请求与 token/cost 是否增长
+   - `Monthly Bills` 点击 `Generate Draft Bills`，检查该用户月账单是否生成
+   - 如需对账，导出 `User Usage Details` 的月度 CSV
+
+### BYOK 说明（当前版本）
+
+当前 `Provider Keys` 是平台级共享池，不是“按用户强隔离”的 BYOK。  
+如果你要做严格 BYOK（每个用户只能使用自己的 provider key），建议下一步给 `provider_keys` 增加 `user_id` 绑定，并在路由层按调用方用户过滤可用 provider keys。
+
 ## MVP Coverage
 
 - API key authentication with hash-at-rest
