@@ -69,7 +69,8 @@ button {
 }
 
 .admin-key button {
-  width: 36px;
+  min-width: 36px;
+  padding: 0 10px;
 }
 
 .metrics {
@@ -151,6 +152,10 @@ button {
 
 .provider-form {
   grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.usage-detail-form {
+  grid-template-columns: 1.1fr 1.5fr 1fr 1fr;
 }
 
 input,

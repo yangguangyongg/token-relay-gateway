@@ -16,17 +16,27 @@ import com.tokenrelay.gateway.service.ProviderKeySecurityService;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
+import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.time.Instant;
+import java.time.YearMonth;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import org.springframework.data.r2dbc.core.R2dbcEntityTemplate;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.r2dbc.core.DatabaseClient.GenericExecuteSpec;
 import org.springframework.r2dbc.core.DatabaseClient;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ServerWebExchange;
@@ -151,6 +161,33 @@ public class AdminController {
         .all();
   }
 
+  @GetMapping("/admin/usage-details")
+  public Flux<Map<String, Object>> usageDetails(
+      ServerWebExchange exchange,
+      @RequestParam(required = false) String month,
+      @RequestParam(required = false) UUID userId) {
+    TimeRange monthRange = resolveMonthRange(month);
+    return usageDetailQuery(monthRange, userId)
+        .fetch()
+        .all();
+  }
+
+  @GetMapping("/admin/billing/monthly.csv")
+  public Mono<ResponseEntity<String>> monthlyBillingCsv(
+      ServerWebExchange exchange,
+      @RequestParam(required = false) String month,
+      @RequestParam(required = false) UUID userId) {
+    TimeRange monthRange = resolveMonthRange(month);
+    return usageDetailQuery(monthRange, userId)
+        .fetch()
+        .all()
+        .collectList()
+        .map(rows -> ResponseEntity.ok()
+            .contentType(new MediaType("text", "csv", StandardCharsets.UTF_8))
+            .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + billingCsvFileName(monthRange.month(), userId) + "\"")
+            .body(toBillingCsv(monthRange.month(), rows)));
+  }
+
   private AdminPrincipal currentAdmin(ServerWebExchange exchange) {
     AdminPrincipal principal = exchange.getAttribute(AdminSecurityWebFilter.ADMIN_PRINCIPAL_ATTR);
     if (principal == null) {
@@ -164,6 +201,161 @@ public class AdminController {
     secureRandom.nextBytes(buffer);
     return HexFormat.of().formatHex(buffer);
   }
+
+  private GenericExecuteSpec usageDetailQuery(TimeRange monthRange, UUID userId) {
+    String sql = """
+        SELECT
+          u.id::text AS user_id,
+          u.email AS user_email,
+          u.display_name AS user_name,
+          ue.provider AS provider,
+          ue.model AS model,
+          count(*) AS requests,
+          coalesce(sum(ue.prompt_tokens), 0) AS prompt_tokens,
+          coalesce(sum(ue.completion_tokens), 0) AS completion_tokens,
+          coalesce(sum(ue.total_tokens), 0) AS total_tokens,
+          max(ue.created_at) AS last_request_at
+        FROM usage_events ue
+        JOIN gateway_users u ON u.id = ue.user_id
+        WHERE ue.created_at >= :start_time
+          AND ue.created_at < :end_time
+        """;
+    if (userId != null) {
+      sql += " AND ue.user_id = :user_id\n";
+    }
+    sql += """
+        GROUP BY u.id, u.email, u.display_name, ue.provider, ue.model
+        ORDER BY u.email ASC, total_tokens DESC, ue.provider ASC, ue.model ASC
+        """;
+
+    GenericExecuteSpec spec = databaseClient.sql(sql)
+        .bind("start_time", monthRange.startInclusive())
+        .bind("end_time", monthRange.endExclusive());
+    if (userId != null) {
+      spec = spec.bind("user_id", userId);
+    }
+    return spec;
+  }
+
+  private TimeRange resolveMonthRange(String rawMonth) {
+    YearMonth month;
+    if (rawMonth == null || rawMonth.isBlank()) {
+      month = YearMonth.now(ZoneOffset.UTC);
+    } else {
+      try {
+        month = YearMonth.parse(rawMonth.trim());
+      } catch (DateTimeParseException ex) {
+        throw new GatewayException(400, "invalid_month", "month must use YYYY-MM format");
+      }
+    }
+
+    Instant start = month.atDay(1).atStartOfDay(ZoneOffset.UTC).toInstant();
+    Instant end = month.plusMonths(1).atDay(1).atStartOfDay(ZoneOffset.UTC).toInstant();
+    return new TimeRange(month, start, end);
+  }
+
+  private String billingCsvFileName(YearMonth month, UUID userId) {
+    if (userId == null) {
+      return "billing-" + month + ".csv";
+    }
+    return "billing-" + month + "-user-" + userId + ".csv";
+  }
+
+  private String toBillingCsv(YearMonth month, List<Map<String, Object>> rows) {
+    StringBuilder csv = new StringBuilder();
+    csv.append("month,user_id,user_email,user_name,provider,model,requests,prompt_tokens,completion_tokens,total_tokens,last_request_at\n");
+    for (Map<String, Object> row : rows) {
+      csv.append(csvCell(month.toString())).append(",");
+      csv.append(csvCell(stringValue(row.get("user_id")))).append(",");
+      csv.append(csvCell(stringValue(row.get("user_email")))).append(",");
+      csv.append(csvCell(stringValue(row.get("user_name")))).append(",");
+      csv.append(csvCell(stringValue(row.get("provider")))).append(",");
+      csv.append(csvCell(stringValue(row.get("model")))).append(",");
+      csv.append(csvCell(stringValue(row.get("requests")))).append(",");
+      csv.append(csvCell(stringValue(row.get("prompt_tokens")))).append(",");
+      csv.append(csvCell(stringValue(row.get("completion_tokens")))).append(",");
+      csv.append(csvCell(stringValue(row.get("total_tokens")))).append(",");
+      csv.append(csvCell(stringValue(row.get("last_request_at")))).append("\n");
+    }
+
+    if (!rows.isEmpty()) {
+      csv.append("\n");
+      csv.append("month,user_id,user_email,user_name,total_requests,total_tokens\n");
+      for (Map<String, Object> summary : summarizeByUser(rows)) {
+        csv.append(csvCell(month.toString())).append(",");
+        csv.append(csvCell(stringValue(summary.get("user_id")))).append(",");
+        csv.append(csvCell(stringValue(summary.get("user_email")))).append(",");
+        csv.append(csvCell(stringValue(summary.get("user_name")))).append(",");
+        csv.append(csvCell(stringValue(summary.get("requests")))).append(",");
+        csv.append(csvCell(stringValue(summary.get("total_tokens")))).append("\n");
+      }
+    }
+
+    return csv.toString();
+  }
+
+  private List<Map<String, Object>> summarizeByUser(List<Map<String, Object>> rows) {
+    record UserAgg(String userId, String userEmail, String userName, long requests, long totalTokens) {}
+    Map<String, UserAgg> accumulator = new java.util.LinkedHashMap<>();
+    for (Map<String, Object> row : rows) {
+      String userId = stringValue(row.get("user_id"));
+      String userEmail = stringValue(row.get("user_email"));
+      String userName = stringValue(row.get("user_name"));
+      long requests = longValue(row.get("requests"));
+      long totalTokens = longValue(row.get("total_tokens"));
+      String key = userId + "|" + userEmail;
+      UserAgg existing = accumulator.get(key);
+      if (existing == null) {
+        accumulator.put(key, new UserAgg(userId, userEmail, userName, requests, totalTokens));
+      } else {
+        accumulator.put(key, new UserAgg(
+            existing.userId(),
+            existing.userEmail(),
+            existing.userName(),
+            existing.requests() + requests,
+            existing.totalTokens() + totalTokens));
+      }
+    }
+
+    List<Map<String, Object>> summarized = new ArrayList<>();
+    for (UserAgg value : accumulator.values()) {
+      summarized.add(Map.of(
+          "user_id", value.userId(),
+          "user_email", value.userEmail(),
+          "user_name", value.userName(),
+          "requests", value.requests(),
+          "total_tokens", value.totalTokens()));
+    }
+    return summarized;
+  }
+
+  private long longValue(Object value) {
+    if (value == null) {
+      return 0L;
+    }
+    if (value instanceof Number number) {
+      return number.longValue();
+    }
+    try {
+      return Long.parseLong(value.toString());
+    } catch (NumberFormatException ignored) {
+      return 0L;
+    }
+  }
+
+  private String stringValue(Object value) {
+    return value == null ? "" : value.toString();
+  }
+
+  private String csvCell(String value) {
+    if (value == null) {
+      return "";
+    }
+    String escaped = value.replace("\"", "\"\"");
+    return "\"" + escaped + "\"";
+  }
+
+  private record TimeRange(YearMonth month, Instant startInclusive, Instant endExclusive) {}
 
   public record CreateUserRequest(@Email String email, @NotBlank String displayName, long monthlyTokenQuota) {}
 

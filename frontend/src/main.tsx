@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Activity, BarChart3, Database, KeyRound, Plus, RefreshCw, Shield, Users } from 'lucide-react';
+import { Activity, BarChart3, Database, Download, KeyRound, Plus, RefreshCw, Shield, Users } from 'lucide-react';
 import './styles.css';
 
 type User = {
@@ -45,12 +45,57 @@ type AuditLog = {
   createdAt: string;
 };
 
+type UsageDetailRow = {
+  user_id: string;
+  user_email: string;
+  user_name: string;
+  provider: string;
+  model: string;
+  requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  last_request_at: string;
+};
+
 type LoginResponse = {
   accessToken: string;
   tokenType: string;
   expiresInSeconds: number;
   username: string;
   roles: string[];
+};
+
+const currentMonthValue = () => new Date().toISOString().slice(0, 7);
+
+const usageDetailsPath = (month: string, userId: string) => {
+  const params = new URLSearchParams();
+  params.set('month', month);
+  if (userId) {
+    params.set('userId', userId);
+  }
+  return `/api/admin/usage-details?${params.toString()}`;
+};
+
+const billingCsvPath = (month: string, userId: string) => {
+  const params = new URLSearchParams();
+  params.set('month', month);
+  if (userId) {
+    params.set('userId', userId);
+  }
+  return `/api/admin/billing/monthly.csv?${params.toString()}`;
+};
+
+const parseDownloadFileName = (contentDisposition: string | null, fallback: string) => {
+  if (!contentDisposition) {
+    return fallback;
+  }
+  const utf8 = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8?.[1]) {
+    return decodeURIComponent(utf8[1]);
+  }
+  const simple = contentDisposition.match(/filename=\"?([^\";]+)\"?/i);
+  return simple?.[1] ?? fallback;
 };
 
 const api = async <T,>(path: string, adminToken?: string, options: RequestInit = {}): Promise<T> => {
@@ -82,6 +127,9 @@ function App() {
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
   const [providerKeys, setProviderKeys] = useState<ProviderKey[]>([]);
   const [usage, setUsage] = useState<UsageRow[]>([]);
+  const [usageDetails, setUsageDetails] = useState<UsageDetailRow[]>([]);
+  const [usageMonth, setUsageMonth] = useState(currentMonthValue());
+  const [usageUserId, setUsageUserId] = useState('');
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [message, setMessage] = useState('');
   const [rawKey, setRawKey] = useState('');
@@ -103,17 +151,19 @@ function App() {
     }
     setMessage('Loading...');
     try {
-      const [loadedUsers, loadedApiKeys, loadedProviders, loadedUsage, loadedAuditLogs] = await Promise.all([
+      const [loadedUsers, loadedApiKeys, loadedProviders, loadedUsage, loadedUsageDetails, loadedAuditLogs] = await Promise.all([
         api<User[]>('/api/admin/users', token),
         api<ApiKey[]>('/api/admin/api-keys', token),
         api<ProviderKey[]>('/api/admin/provider-keys', token),
         api<UsageRow[]>('/api/admin/usage-summary', token),
+        api<UsageDetailRow[]>(usageDetailsPath(usageMonth, usageUserId), token),
         api<AuditLog[]>('/api/admin/audit-logs', token)
       ]);
       setUsers(loadedUsers);
       setApiKeys(loadedApiKeys);
       setProviderKeys(loadedProviders);
       setUsage(loadedUsage);
+      setUsageDetails(loadedUsageDetails);
       setAuditLogs(loadedAuditLogs);
       setMessage('Ready');
     } catch (error) {
@@ -153,6 +203,7 @@ function App() {
     setApiKeys([]);
     setProviderKeys([]);
     setUsage([]);
+    setUsageDetails([]);
     setAuditLogs([]);
     setRawKey('');
     setMessage('Logged out');
@@ -204,6 +255,47 @@ function App() {
       })
     });
     event.currentTarget.reset();
+    await load();
+  };
+
+  const downloadBillingCsv = async () => {
+    if (!adminToken) {
+      setMessage('Please login first');
+      return;
+    }
+    setMessage('Generating billing CSV...');
+    try {
+      const response = await fetch(billingCsvPath(usageMonth, usageUserId), {
+        headers: {
+          Authorization: `Bearer ${adminToken}`
+        }
+      });
+      if (!response.ok) {
+        const body = await response.text();
+        throw new Error(body || `Request failed: ${response.status}`);
+      }
+
+      const blob = await response.blob();
+      const downloadName = parseDownloadFileName(
+        response.headers.get('content-disposition'),
+        `billing-${usageMonth}.csv`
+      );
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = downloadName;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setMessage('Billing CSV downloaded');
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : 'Failed to export billing CSV');
+    }
+  };
+
+  const reloadUsageDetails = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
     await load();
   };
 
@@ -304,6 +396,33 @@ function App() {
 
         <Panel title="Usage" icon={<BarChart3 />}>
           <Table rows={usage} columns={['provider', 'model', 'requests', 'total_tokens']} />
+        </Panel>
+
+        <Panel title="User Usage Details" icon={<BarChart3 />}>
+          <form onSubmit={reloadUsageDetails} className="form usage-detail-form">
+            <input
+              type="month"
+              value={usageMonth}
+              onChange={(event) => setUsageMonth(event.target.value)}
+              required
+            />
+            <select value={usageUserId} onChange={(event) => setUsageUserId(event.target.value)}>
+              <option value="">All users</option>
+              {users.map((user) => <option key={user.id} value={user.id}>{user.email}</option>)}
+            </select>
+            <button type="submit">
+              <RefreshCw size={16} />
+              Refresh details
+            </button>
+            <button type="button" onClick={downloadBillingCsv}>
+              <Download size={16} />
+              Export monthly CSV
+            </button>
+          </form>
+          <Table
+            rows={usageDetails}
+            columns={['user_email', 'provider', 'model', 'requests', 'prompt_tokens', 'completion_tokens', 'total_tokens', 'last_request_at']}
+          />
         </Panel>
 
         <Panel title="Audit" icon={<Activity />}>
