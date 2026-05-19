@@ -12,6 +12,7 @@ import com.tokenrelay.gateway.repository.ProviderKeyRepository;
 import com.tokenrelay.gateway.service.AuditService;
 import com.tokenrelay.gateway.service.GatewayException;
 import com.tokenrelay.gateway.service.HashService;
+import com.tokenrelay.gateway.service.ProviderHealthCheckService;
 import com.tokenrelay.gateway.service.ProviderKeySecurityService;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Email;
@@ -25,7 +26,9 @@ import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.r2dbc.core.R2dbcEntityTemplate;
 import org.springframework.http.HttpHeaders;
@@ -34,6 +37,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.r2dbc.core.DatabaseClient.GenericExecuteSpec;
 import org.springframework.r2dbc.core.DatabaseClient;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -52,6 +56,7 @@ public class AdminController {
   private final AuditLogRepository auditLogs;
   private final HashService hashService;
   private final ProviderKeySecurityService providerKeySecurity;
+  private final ProviderHealthCheckService providerHealthCheckService;
   private final AuditService auditService;
   private final DatabaseClient databaseClient;
   private final SecureRandom secureRandom = new SecureRandom();
@@ -63,6 +68,7 @@ public class AdminController {
       AuditLogRepository auditLogs,
       HashService hashService,
       ProviderKeySecurityService providerKeySecurity,
+      ProviderHealthCheckService providerHealthCheckService,
       AuditService auditService,
       R2dbcEntityTemplate template) {
     this.users = users;
@@ -71,6 +77,7 @@ public class AdminController {
     this.auditLogs = auditLogs;
     this.hashService = hashService;
     this.providerKeySecurity = providerKeySecurity;
+    this.providerHealthCheckService = providerHealthCheckService;
     this.auditService = auditService;
     this.databaseClient = template.getDatabaseClient();
   }
@@ -138,19 +145,105 @@ public class AdminController {
       ServerWebExchange exchange,
       @Valid @RequestBody CreateProviderKeyRequest request) {
     String actor = currentAdmin(exchange).username();
-    ProviderKey providerKey = new ProviderKey(
-        null,
-        request.provider(),
-        request.name(),
-        request.baseUrl(),
-        request.apiKey(),
-        request.azureDeployment(),
-        "ACTIVE",
-        request.priority(),
-        null);
-    return providerKeys.save(providerKeySecurity.encryptForStorage(providerKey))
-        .flatMap(saved -> auditService.log(actor, "CREATE_PROVIDER_KEY", saved.id().toString(), saved.provider()).thenReturn(saved))
-        .map(this::toProviderKeyView);
+    return resolveOwnerUserId(request.ownerUserId())
+        .flatMap(ownerRef -> {
+          UUID ownerUserId = ownerRef.orElse(null);
+          ProviderKey providerKey = new ProviderKey(
+              null,
+              ownerUserId,
+              normalizeProvider(request.provider()),
+              request.name(),
+              request.baseUrl(),
+              request.apiKey(),
+              request.azureDeployment(),
+              normalizeProviderStatus(request.status()),
+              request.priority(),
+              "UNKNOWN",
+              null,
+              null,
+              null,
+              null);
+          return providerKeys.save(providerKeySecurity.encryptForStorage(providerKey))
+              .flatMap(saved -> auditService.log(actor, "CREATE_PROVIDER_KEY", saved.id().toString(), saved.provider()).thenReturn(saved))
+              .map(this::toProviderKeyView);
+        });
+  }
+
+  @PostMapping("/admin/provider-keys/{providerKeyId}")
+  public Mono<ProviderKeyView> updateProviderKey(
+      ServerWebExchange exchange,
+      @PathVariable UUID providerKeyId,
+      @Valid @RequestBody UpdateProviderKeyRequest request) {
+    String actor = currentAdmin(exchange).username();
+    return providerKeys.findById(providerKeyId)
+        .switchIfEmpty(Mono.error(new GatewayException(404, "provider_key_not_found", "Provider key not found")))
+        .flatMap(existing -> resolveOwnerUserIdForUpdate(existing, request)
+            .flatMap(ownerRef -> {
+              UUID ownerUserId = ownerRef.orElse(null);
+              ProviderKey updated = new ProviderKey(
+                  existing.id(),
+                  ownerUserId,
+                  request.provider() == null || request.provider().isBlank()
+                      ? existing.provider()
+                      : normalizeProvider(request.provider()),
+                  request.name() == null || request.name().isBlank() ? existing.name() : request.name().trim(),
+                  request.baseUrl() == null || request.baseUrl().isBlank() ? existing.baseUrl() : request.baseUrl().trim(),
+                  request.apiKey() == null || request.apiKey().isBlank() ? existing.apiKey() : request.apiKey().trim(),
+                  request.azureDeployment() == null ? existing.azureDeployment() : blankToNull(request.azureDeployment()),
+                  request.status() == null || request.status().isBlank()
+                      ? existing.status()
+                      : normalizeProviderStatus(request.status()),
+                  request.priority() == null ? existing.priority() : request.priority(),
+                  existing.healthStatus(),
+                  existing.lastCheckedAt(),
+                  existing.lastError(),
+                  existing.createdAt(),
+                  Instant.now());
+              ProviderKey toSave = request.apiKey() == null || request.apiKey().isBlank()
+                  ? updated
+                  : providerKeySecurity.encryptForStorage(updated);
+              return providerKeys.save(toSave)
+                  .flatMap(saved -> auditService.log(actor, "UPDATE_PROVIDER_KEY", saved.id().toString(), saved.provider()).thenReturn(saved))
+                  .map(this::toProviderKeyView);
+            }));
+  }
+
+  @PostMapping("/admin/provider-keys/{providerKeyId}/check")
+  public Mono<ProviderHealthCheckView> checkProviderKey(
+      ServerWebExchange exchange,
+      @PathVariable UUID providerKeyId) {
+    String actor = currentAdmin(exchange).username();
+    return providerKeys.findById(providerKeyId)
+        .switchIfEmpty(Mono.error(new GatewayException(404, "provider_key_not_found", "Provider key not found")))
+        .map(providerKeySecurity::decryptForRuntime)
+        .flatMap(providerHealthCheckService::check)
+        .flatMap(result -> providerKeys.findById(providerKeyId)
+            .flatMap(existing -> providerKeys.save(new ProviderKey(
+                existing.id(),
+                existing.ownerUserId(),
+                existing.provider(),
+                existing.name(),
+                existing.baseUrl(),
+                existing.apiKey(),
+                existing.azureDeployment(),
+                existing.status(),
+                existing.priority(),
+                result.healthStatus(),
+                result.checkedAt(),
+                result.message(),
+                existing.createdAt(),
+                Instant.now()))
+                .flatMap(saved -> auditService.log(actor, "CHECK_PROVIDER_KEY", saved.id().toString(), result.healthStatus())
+                    .thenReturn(new ProviderHealthCheckView(
+                        saved.id(),
+                        saved.provider(),
+                        saved.name(),
+                        result.healthStatus(),
+                        result.statusCode(),
+                        result.message(),
+                        result.latencyMs(),
+                        result.checkedAt(),
+                        saved.ownerUserId())))));
   }
 
   @GetMapping("/admin/audit-logs")
@@ -389,6 +482,56 @@ public class AdminController {
 
   private record TimeRange(YearMonth month, Instant startInclusive, Instant endExclusive) {}
 
+  private Mono<Optional<UUID>> resolveOwnerUserId(UUID ownerUserId) {
+    if (ownerUserId == null) {
+      return Mono.just(Optional.empty());
+    }
+    return users.existsById(ownerUserId)
+        .flatMap(exists -> exists
+            ? Mono.just(Optional.of(ownerUserId))
+            : Mono.error(new GatewayException(400, "owner_user_not_found", "ownerUserId does not exist")));
+  }
+
+  private Mono<Optional<UUID>> resolveOwnerUserIdForUpdate(ProviderKey existing, UpdateProviderKeyRequest request) {
+    if (Boolean.TRUE.equals(request.platformScope())) {
+      return Mono.just(Optional.empty());
+    }
+    if (request.ownerUserId() == null) {
+      return Mono.just(Optional.ofNullable(existing.ownerUserId()));
+    }
+    return resolveOwnerUserId(request.ownerUserId());
+  }
+
+  private String normalizeProvider(String provider) {
+    if (provider == null || provider.isBlank()) {
+      throw new GatewayException(400, "invalid_provider", "provider is required");
+    }
+    String normalized = provider.trim().toUpperCase(Locale.ROOT);
+    return switch (normalized) {
+      case "OPENAI", "ANTHROPIC", "AZURE_OPENAI", "GEMINI" -> normalized;
+      default -> throw new GatewayException(400, "invalid_provider", "provider must be OPENAI/ANTHROPIC/AZURE_OPENAI/GEMINI");
+    };
+  }
+
+  private String normalizeProviderStatus(String status) {
+    if (status == null || status.isBlank()) {
+      return "ACTIVE";
+    }
+    String normalized = status.trim().toUpperCase(Locale.ROOT);
+    return switch (normalized) {
+      case "ACTIVE", "DISABLED" -> normalized;
+      default -> throw new GatewayException(400, "invalid_provider_status", "status must be ACTIVE or DISABLED");
+    };
+  }
+
+  private String blankToNull(String value) {
+    if (value == null) {
+      return null;
+    }
+    String trimmed = value.trim();
+    return trimmed.isEmpty() ? null : trimmed;
+  }
+
   public record CreateUserRequest(@Email String email, @NotBlank String displayName, long monthlyTokenQuota) {}
 
   public record CreateApiKeyRequest(UUID userId, @NotBlank String name, int rateLimitPerMinute) {}
@@ -401,10 +544,25 @@ public class AdminController {
       @NotBlank String baseUrl,
       @NotBlank String apiKey,
       String azureDeployment,
-      int priority) {}
+      int priority,
+      String status,
+      UUID ownerUserId) {}
+
+  public record UpdateProviderKeyRequest(
+      String provider,
+      String name,
+      String baseUrl,
+      String apiKey,
+      String azureDeployment,
+      Integer priority,
+      String status,
+      UUID ownerUserId,
+      Boolean platformScope) {}
 
   public record ProviderKeyView(
       UUID id,
+      UUID ownerUserId,
+      String ownerScope,
       String provider,
       String name,
       String baseUrl,
@@ -412,11 +570,28 @@ public class AdminController {
       String azureDeployment,
       String status,
       int priority,
-      Instant createdAt) {}
+      String healthStatus,
+      Instant lastCheckedAt,
+      String lastError,
+      Instant createdAt,
+      Instant updatedAt) {}
+
+  public record ProviderHealthCheckView(
+      UUID id,
+      String provider,
+      String name,
+      String healthStatus,
+      int httpStatus,
+      String message,
+      long latencyMs,
+      Instant checkedAt,
+      UUID ownerUserId) {}
 
   private ProviderKeyView toProviderKeyView(ProviderKey key) {
     return new ProviderKeyView(
         key.id(),
+        key.ownerUserId(),
+        key.ownerUserId() == null ? "PLATFORM" : "USER",
         key.provider(),
         key.name(),
         key.baseUrl(),
@@ -424,6 +599,10 @@ public class AdminController {
         key.azureDeployment(),
         key.status(),
         key.priority(),
-        key.createdAt());
+        key.healthStatus(),
+        key.lastCheckedAt(),
+        key.lastError(),
+        key.createdAt(),
+        key.updatedAt());
   }
 }

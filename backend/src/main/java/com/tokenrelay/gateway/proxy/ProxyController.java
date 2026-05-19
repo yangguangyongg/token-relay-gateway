@@ -74,7 +74,7 @@ public class ProxyController {
   }
 
   private Mono<ResponseEntity<Flux<String>>> routeWithFallback(AuthContext context, JsonNode request, String requestId) {
-    return router.candidates(request).flatMap(candidates -> {
+    return router.candidates(context, request).flatMap(candidates -> {
       if (candidates.isEmpty()) {
         return Mono.error(new GatewayException(503, "no_provider", "No active provider key can serve this model"));
       }
@@ -98,6 +98,7 @@ public class ProxyController {
           return ResponseEntity.status(response.getStatusCode())
               .header("X-Request-Id", requestId)
               .header("X-Provider", candidate.providerKey().provider())
+              .header("X-Provider-Scope", candidate.byokScope() ? "USER_BYOK" : "PLATFORM_SHARED")
               .contentType(response.getHeaders().getContentType() == null ? MediaType.APPLICATION_JSON : response.getHeaders().getContentType())
               .body(body);
         })

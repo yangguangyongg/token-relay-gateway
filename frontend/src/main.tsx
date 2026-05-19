@@ -22,11 +22,17 @@ type ApiKey = {
 
 type ProviderKey = {
   id: string;
+  ownerUserId: string | null;
+  ownerScope: string;
   provider: string;
   name: string;
   baseUrl: string;
   status: string;
   priority: number;
+  healthStatus: string;
+  lastCheckedAt: string | null;
+  lastError: string | null;
+  updatedAt: string | null;
 };
 
 type UsageRow = {
@@ -309,6 +315,7 @@ function App() {
   const createProvider = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
+    const ownerUserId = (form.get('ownerUserId') || '').toString();
     await api('/api/admin/provider-keys', adminToken, {
       method: 'POST',
       body: JSON.stringify({
@@ -317,10 +324,55 @@ function App() {
         baseUrl: form.get('baseUrl'),
         apiKey: form.get('apiKey'),
         azureDeployment: form.get('azureDeployment') || null,
-        priority: Number(form.get('priority'))
+        priority: Number(form.get('priority')),
+        status: 'ACTIVE',
+        ownerUserId: ownerUserId === '__PLATFORM__' ? null : ownerUserId
       })
     });
     event.currentTarget.reset();
+    await load();
+  };
+
+  const updateProviderSettings = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const providerKeyId = (form.get('providerKeyId') || '').toString();
+    if (!providerKeyId) {
+      setMessage('Select a provider key first');
+      return;
+    }
+
+    const ownerChoice = (form.get('ownerUserId') || '').toString();
+    const payload: Record<string, unknown> = {
+      priority: Number(form.get('priority')),
+      status: form.get('status')
+    };
+    if (ownerChoice === '__PLATFORM__') {
+      payload.platformScope = true;
+      payload.ownerUserId = null;
+    } else if (ownerChoice && ownerChoice !== '__UNCHANGED__') {
+      payload.platformScope = false;
+      payload.ownerUserId = ownerChoice;
+    }
+
+    await api(`/api/admin/provider-keys/${encodeURIComponent(providerKeyId)}`, adminToken, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+    await load();
+  };
+
+  const checkProviderKey = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const providerKeyId = (form.get('providerKeyId') || '').toString();
+    if (!providerKeyId) {
+      setMessage('Select a provider key first');
+      return;
+    }
+    await api(`/api/admin/provider-keys/${encodeURIComponent(providerKeyId)}/check`, adminToken, {
+      method: 'POST'
+    });
     await load();
   };
 
@@ -507,6 +559,10 @@ function App() {
               <option>AZURE_OPENAI</option>
               <option>GEMINI</option>
             </select>
+            <select name="ownerUserId" defaultValue="__PLATFORM__" required>
+              <option value="__PLATFORM__">Platform shared</option>
+              {users.map((user) => <option key={user.id} value={user.id}>{user.email}</option>)}
+            </select>
             <input name="name" placeholder="Provider name" required />
             <input name="baseUrl" placeholder="https://api.openai.com" required />
             <input name="apiKey" type="password" placeholder="Provider API key" required />
@@ -514,7 +570,45 @@ function App() {
             <input name="priority" type="number" defaultValue="100" min="0" required />
             <button><Plus size={16} /> Add provider</button>
           </form>
-          <Table rows={providerKeys} columns={['provider', 'name', 'baseUrl', 'status', 'priority']} />
+          <form onSubmit={updateProviderSettings} className="form provider-form">
+            <select name="providerKeyId" required>
+              <option value="">Select provider key</option>
+              {providerKeys.map((key) => (
+                <option key={key.id} value={key.id}>
+                  {key.provider} / {key.name} / {key.ownerScope}
+                </option>
+              ))}
+            </select>
+            <input name="priority" type="number" defaultValue="100" min="0" required />
+            <select name="status" defaultValue="ACTIVE" required>
+              <option value="ACTIVE">ACTIVE</option>
+              <option value="DISABLED">DISABLED</option>
+            </select>
+            <select name="ownerUserId" defaultValue="__UNCHANGED__" required>
+              <option value="__UNCHANGED__">Keep owner unchanged</option>
+              <option value="__PLATFORM__">Move to platform shared</option>
+              {users.map((user) => <option key={user.id} value={user.id}>{user.email}</option>)}
+            </select>
+            <button type="submit">
+              <RefreshCw size={16} />
+              Update provider
+            </button>
+          </form>
+          <form onSubmit={checkProviderKey} className="form provider-form">
+            <select name="providerKeyId" required>
+              <option value="">Select provider key</option>
+              {providerKeys.map((key) => (
+                <option key={key.id} value={key.id}>
+                  {key.provider} / {key.name} / {key.ownerScope}
+                </option>
+              ))}
+            </select>
+            <button type="submit">
+              <RefreshCw size={16} />
+              Check key status
+            </button>
+          </form>
+          <Table rows={providerKeys} columns={['ownerScope', 'ownerUserId', 'provider', 'name', 'baseUrl', 'status', 'priority', 'healthStatus', 'lastCheckedAt', 'lastError']} />
         </Panel>
 
         <Panel title="Usage" icon={<BarChart3 />}>

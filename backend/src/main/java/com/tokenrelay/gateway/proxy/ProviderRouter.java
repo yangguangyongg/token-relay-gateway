@@ -2,12 +2,14 @@ package com.tokenrelay.gateway.proxy;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.tokenrelay.gateway.adapter.ProviderAdapter;
+import com.tokenrelay.gateway.auth.AuthContext;
 import com.tokenrelay.gateway.domain.ProviderKey;
 import com.tokenrelay.gateway.repository.ProviderKeyRepository;
 import com.tokenrelay.gateway.service.ProviderKeySecurityService;
 import java.util.Comparator;
 import java.util.List;
 import org.springframework.stereotype.Service;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 @Service
@@ -25,12 +27,21 @@ public class ProviderRouter {
     this.providerKeySecurity = providerKeySecurity;
   }
 
-  public Mono<List<RouteCandidate>> candidates(JsonNode request) {
-    return providerKeys.findByStatusOrderByPriorityAsc("ACTIVE")
-        .map(providerKeySecurity::decryptForRuntime)
-        .flatMap(key -> adapterFor(key, request).map(adapter -> new RouteCandidate(key, adapter)))
-        .sort(Comparator.comparingInt(candidate -> routeScore(candidate.providerKey(), request)))
-        .collectList();
+  public Mono<List<RouteCandidate>> candidates(AuthContext context, JsonNode request) {
+    return providerKeys.findByOwnerUserIdAndStatusOrderByPriorityAsc(context.user().id(), "ACTIVE")
+        .collectList()
+        .flatMap(userOwnedKeys -> {
+          boolean hasUserOwned = !userOwnedKeys.isEmpty();
+          Flux<ProviderKey> pool = hasUserOwned
+              ? Flux.fromIterable(userOwnedKeys)
+              : providerKeys.findByOwnerUserIdIsNullAndStatusOrderByPriorityAsc("ACTIVE");
+          return pool
+              .filter(this::isRoutableByHealth)
+              .map(providerKeySecurity::decryptForRuntime)
+              .flatMap(key -> adapterFor(key, request).map(adapter -> new RouteCandidate(key, adapter, hasUserOwned)))
+              .sort(Comparator.comparingInt(candidate -> routeScore(candidate.providerKey(), request)))
+              .collectList();
+        });
   }
 
   private Mono<ProviderAdapter> adapterFor(ProviderKey key, JsonNode request) {
@@ -50,5 +61,13 @@ public class ProviderRouter {
     return modelScore + key.priority();
   }
 
-  public record RouteCandidate(ProviderKey providerKey, ProviderAdapter adapter) {}
+  private boolean isRoutableByHealth(ProviderKey key) {
+    String health = key.healthStatus();
+    if (health == null || health.isBlank()) {
+      return true;
+    }
+    return !"UNHEALTHY".equalsIgnoreCase(health);
+  }
+
+  public record RouteCandidate(ProviderKey providerKey, ProviderAdapter adapter, boolean byokScope) {}
 }

@@ -8,6 +8,7 @@ import org.springframework.data.relational.core.mapping.Table;
 @Table("provider_keys")
 public record ProviderKey(
     @Id UUID id,
+    UUID ownerUserId,
     String provider,
     String name,
     String baseUrl,
@@ -15,8 +16,26 @@ public record ProviderKey(
     String azureDeployment,
     String status,
     int priority,
-    Instant createdAt) {
+    String healthStatus,
+    Instant lastCheckedAt,
+    String lastError,
+    Instant createdAt,
+    Instant updatedAt) {
   public ProviderKey withApiKey(String nextApiKey) {
-    return new ProviderKey(id, provider, name, baseUrl, nextApiKey, azureDeployment, status, priority, createdAt);
+    return new ProviderKey(
+        id,
+        ownerUserId,
+        provider,
+        name,
+        baseUrl,
+        nextApiKey,
+        azureDeployment,
+        status,
+        priority,
+        healthStatus,
+        lastCheckedAt,
+        lastError,
+        createdAt,
+        updatedAt);
   }
 }

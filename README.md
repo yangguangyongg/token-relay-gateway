@@ -51,6 +51,36 @@ Authorization: Bearer <gateway-api-key>
 X-Client-Region: NZ
 ```
 
+## Provider 管理与 BYOK
+
+当前版本支持 `OPENAI`、`ANTHROPIC`、`GEMINI`、`AZURE_OPENAI`，并支持平台共享 key 与用户 BYOK 两种模式。
+
+- `ownerUserId = null`：平台共享 Provider Key（Platform Shared）
+- `ownerUserId = <user-id>`：用户自有 Provider Key（BYOK）
+
+路由规则：
+
+1. 如果用户存在 `ACTIVE` 的自有 Provider Key，则仅使用该用户自己的 key 池（严格 BYOK）。
+2. 如果用户没有可用自有 key，则使用平台共享 key 池。
+3. 在同一池内按模型匹配 + `priority` 排序，失败自动 fallback 到下一条。
+4. `healthStatus = UNHEALTHY` 的 key 不参与路由。
+
+### Admin Provider API
+
+- `GET /api/admin/provider-keys`：查看所有 provider keys（含 ownerScope、healthStatus）
+- `POST /api/admin/provider-keys`：创建 provider key（可传 `ownerUserId`，为空表示平台共享）
+- `POST /api/admin/provider-keys/{id}`：更新状态/优先级/归属等
+- `POST /api/admin/provider-keys/{id}/check`：检测 key 有效性并写回健康状态
+
+### User BYOK API
+
+用户可用自己的 `Gateway API Key` 自助管理 BYOK：
+
+- `GET /api/me/provider-keys`
+- `POST /api/me/provider-keys`
+- `POST /api/me/provider-keys/{id}`
+- `POST /api/me/provider-keys/{id}/check`
+
 ## API Examples
 
 OpenAI-compatible chat completions:
@@ -124,6 +154,7 @@ curl -N http://localhost:8080/v1/chat/completions \
 - Admin login with JWT session and RBAC (`ADMIN`, `VIEWER`)
 - Admin IP allow-list check
 - Admin APIs for users, gateway API keys, provider keys, usage summary, audit logs
+- Provider management with BYOK ownership, priority, health checks, and fallback
 - Real token metering from provider usage fields (with fallback estimation)
 - Model pricing table and per-request estimated cost accounting
 - Monthly billing lifecycle (`DRAFT`, `CONFIRMED`, `SENT`, `PAID`) and CSV export
