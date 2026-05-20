@@ -5,15 +5,12 @@ import java.util.UUID;
 import org.springframework.data.annotation.Id;
 import org.springframework.data.relational.core.mapping.Table;
 
-@Table("api_keys")
-public record ApiKeyRecord(
+@Table("workspace_memberships")
+public record WorkspaceMembership(
     @Id UUID id,
-    UUID userId,
     UUID workspaceId,
-    String name,
-    String keyPrefix,
-    String keyHash,
+    UUID userId,
+    String role,
     String status,
-    int rateLimitPerMinute,
     Instant createdAt,
-    Instant lastUsedAt) {}
+    Instant updatedAt) {}

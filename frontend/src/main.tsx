@@ -14,6 +14,7 @@ type User = {
 type ApiKey = {
   id: string;
   userId: string;
+  workspaceId: string;
   name: string;
   keyPrefix: string;
   status: string;
@@ -105,6 +106,40 @@ type MonthlyBill = {
   user_name: string;
 };
 
+type WorkspaceRow = {
+  workspace_id: string;
+  workspace_name: string;
+  workspace_slug: string;
+  workspace_status: string;
+  created_at: string;
+  member_count: number;
+  active_key_count: number;
+};
+
+type WorkspaceMemberRow = {
+  membership_id: string;
+  workspace_id: string;
+  user_id: string;
+  user_email: string;
+  user_name: string;
+  role: string;
+  status: string;
+  created_at: string;
+};
+
+type WorkspaceModelConfigRow = {
+  id: string;
+  workspaceId: string;
+  provider: string;
+  modelPattern: string;
+  enabled: boolean;
+  maxTokens: number | null;
+  status: string;
+  createdByUserId: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
 type LoginResponse = {
   accessToken: string;
   tokenType: string;
@@ -134,6 +169,9 @@ const billingCsvPath = (month: string, userId: string) => {
 };
 
 const billsPath = (month: string) => `/api/admin/bills?month=${encodeURIComponent(month)}`;
+const workspacesPath = () => '/api/admin/workspaces';
+const workspaceMembersPath = (workspaceId: string) => `/api/admin/workspaces/${encodeURIComponent(workspaceId)}/members`;
+const workspaceModelConfigsPath = (workspaceId: string) => `/api/admin/workspaces/${encodeURIComponent(workspaceId)}/model-configs`;
 
 const parseDownloadFileName = (contentDisposition: string | null, fallback: string) => {
   if (!contentDisposition) {
@@ -183,6 +221,10 @@ function App() {
   const [pricingModels, setPricingModels] = useState<ModelPricing[]>([]);
   const [billingPolicies, setBillingPolicies] = useState<BillingPolicy[]>([]);
   const [monthlyBills, setMonthlyBills] = useState<MonthlyBill[]>([]);
+  const [workspaces, setWorkspaces] = useState<WorkspaceRow[]>([]);
+  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState('');
+  const [workspaceMembers, setWorkspaceMembers] = useState<WorkspaceMemberRow[]>([]);
+  const [workspaceModelConfigs, setWorkspaceModelConfigs] = useState<WorkspaceModelConfigRow[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [message, setMessage] = useState('');
   const [rawKey, setRawKey] = useState('');
@@ -213,6 +255,7 @@ function App() {
         loadedPricingModels,
         loadedBillingPolicies,
         loadedMonthlyBills,
+        loadedWorkspaces,
         loadedAuditLogs
       ] = await Promise.all([
         api<User[]>('/api/admin/users', token),
@@ -223,6 +266,7 @@ function App() {
         api<ModelPricing[]>('/api/admin/pricing/models', token),
         api<BillingPolicy[]>('/api/admin/billing/policies', token),
         api<MonthlyBill[]>(billsPath(billMonth), token),
+        api<WorkspaceRow[]>(workspacesPath(), token),
         api<AuditLog[]>('/api/admin/audit-logs', token)
       ]);
       setUsers(loadedUsers);
@@ -233,11 +277,40 @@ function App() {
       setPricingModels(loadedPricingModels);
       setBillingPolicies(loadedBillingPolicies);
       setMonthlyBills(loadedMonthlyBills);
+      setWorkspaces(loadedWorkspaces);
       setAuditLogs(loadedAuditLogs);
+      const nextWorkspaceId = selectedWorkspaceId && loadedWorkspaces.some((item) => item.workspace_id === selectedWorkspaceId)
+        ? selectedWorkspaceId
+        : (loadedWorkspaces[0]?.workspace_id ?? '');
+      setSelectedWorkspaceId(nextWorkspaceId);
+      if (nextWorkspaceId) {
+        const [membersData, modelConfigData] = await Promise.all([
+          api<WorkspaceMemberRow[]>(workspaceMembersPath(nextWorkspaceId), token),
+          api<WorkspaceModelConfigRow[]>(workspaceModelConfigsPath(nextWorkspaceId), token)
+        ]);
+        setWorkspaceMembers(membersData);
+        setWorkspaceModelConfigs(modelConfigData);
+      } else {
+        setWorkspaceMembers([]);
+        setWorkspaceModelConfigs([]);
+      }
       setMessage('Ready');
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Unknown error');
     }
+  };
+
+  const loadWorkspaceDetails = async (workspaceId: string, tokenOverride?: string) => {
+    const token = tokenOverride ?? adminToken;
+    if (!token || !workspaceId) {
+      return;
+    }
+    const [membersData, modelConfigData] = await Promise.all([
+      api<WorkspaceMemberRow[]>(workspaceMembersPath(workspaceId), token),
+      api<WorkspaceModelConfigRow[]>(workspaceModelConfigsPath(workspaceId), token)
+    ]);
+    setWorkspaceMembers(membersData);
+    setWorkspaceModelConfigs(modelConfigData);
   };
 
   useEffect(() => {
@@ -276,6 +349,10 @@ function App() {
     setPricingModels([]);
     setBillingPolicies([]);
     setMonthlyBills([]);
+    setWorkspaces([]);
+    setSelectedWorkspaceId('');
+    setWorkspaceMembers([]);
+    setWorkspaceModelConfigs([]);
     setAuditLogs([]);
     setRawKey('');
     setMessage('Logged out');
@@ -299,10 +376,12 @@ function App() {
   const createApiKey = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
+    const workspaceId = (form.get('workspaceId') || '').toString();
     const response = await api<{ rawKey: string }>('/api/admin/api-keys', adminToken, {
       method: 'POST',
       body: JSON.stringify({
         userId: form.get('userId'),
+        workspaceId: workspaceId || null,
         name: form.get('name'),
         rateLimitPerMinute: Number(form.get('rateLimitPerMinute'))
       })
@@ -374,6 +453,54 @@ function App() {
       method: 'POST'
     });
     await load();
+  };
+
+  const refreshSelectedWorkspace = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedWorkspaceId) {
+      setMessage('Select a workspace first');
+      return;
+    }
+    await loadWorkspaceDetails(selectedWorkspaceId);
+  };
+
+  const upsertWorkspaceMember = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedWorkspaceId) {
+      setMessage('Select a workspace first');
+      return;
+    }
+    const form = new FormData(event.currentTarget);
+    await api(`/api/admin/workspaces/${encodeURIComponent(selectedWorkspaceId)}/members`, adminToken, {
+      method: 'POST',
+      body: JSON.stringify({
+        userEmail: form.get('userEmail'),
+        role: form.get('role'),
+        status: form.get('status')
+      })
+    });
+    await loadWorkspaceDetails(selectedWorkspaceId);
+  };
+
+  const upsertWorkspaceModelConfig = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedWorkspaceId) {
+      setMessage('Select a workspace first');
+      return;
+    }
+    const form = new FormData(event.currentTarget);
+    const maxTokensRaw = (form.get('maxTokens') || '').toString().trim();
+    await api(`/api/admin/workspaces/${encodeURIComponent(selectedWorkspaceId)}/model-configs`, adminToken, {
+      method: 'POST',
+      body: JSON.stringify({
+        provider: form.get('provider'),
+        modelPattern: form.get('modelPattern'),
+        enabled: form.get('enabled') === 'on',
+        maxTokens: maxTokensRaw ? Number(maxTokensRaw) : null,
+        status: form.get('status')
+      })
+    });
+    await loadWorkspaceDetails(selectedWorkspaceId);
   };
 
   const createPricingModel = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -533,9 +660,62 @@ function App() {
             <input name="email" type="email" placeholder="email@example.com" required />
             <input name="displayName" placeholder="Display name" required />
             <input name="monthlyTokenQuota" type="number" defaultValue="1000000" min="1" required />
+            <input name="password" type="password" placeholder="Password (optional)" />
             <button><Plus size={16} /> Create user</button>
           </form>
           <Table rows={users} columns={['email', 'displayName', 'status', 'monthlyTokenQuota']} />
+        </Panel>
+
+        <Panel title="Workspaces" icon={<Users />}>
+          <form onSubmit={refreshSelectedWorkspace} className="form">
+            <select value={selectedWorkspaceId} onChange={(event) => setSelectedWorkspaceId(event.target.value)} required>
+              <option value="">Select workspace</option>
+              {workspaces.map((workspace) => (
+                <option key={workspace.workspace_id} value={workspace.workspace_id}>
+                  {workspace.workspace_name} ({workspace.workspace_slug})
+                </option>
+              ))}
+            </select>
+            <button type="submit">
+              <RefreshCw size={16} />
+              Load workspace config
+            </button>
+          </form>
+          <Table rows={workspaces} columns={['workspace_name', 'workspace_slug', 'workspace_status', 'member_count', 'active_key_count']} />
+          <form onSubmit={upsertWorkspaceMember} className="form">
+            <input name="userEmail" type="email" placeholder="member email" required />
+            <select name="role" defaultValue="ADMIN" required>
+              <option value="OWNER">OWNER</option>
+              <option value="ADMIN">ADMIN</option>
+              <option value="MEMBER">MEMBER</option>
+            </select>
+            <select name="status" defaultValue="ACTIVE" required>
+              <option value="ACTIVE">ACTIVE</option>
+              <option value="DISABLED">DISABLED</option>
+            </select>
+            <button type="submit"><Plus size={16} /> Upsert member</button>
+          </form>
+          <Table rows={workspaceMembers} columns={['user_email', 'user_name', 'role', 'status']} />
+          <form onSubmit={upsertWorkspaceModelConfig} className="form">
+            <select name="provider" defaultValue="OPENAI" required>
+              <option value="OPENAI">OPENAI</option>
+              <option value="ANTHROPIC">ANTHROPIC</option>
+              <option value="AZURE_OPENAI">AZURE_OPENAI</option>
+              <option value="GEMINI">GEMINI</option>
+            </select>
+            <input name="modelPattern" placeholder="model pattern, e.g. gpt-4o-mini" required />
+            <input name="maxTokens" type="number" min="1" placeholder="max tokens (optional)" />
+            <label className="checkbox-field">
+              <input name="enabled" type="checkbox" defaultChecked />
+              <span>Enabled</span>
+            </label>
+            <select name="status" defaultValue="ACTIVE" required>
+              <option value="ACTIVE">ACTIVE</option>
+              <option value="DISABLED">DISABLED</option>
+            </select>
+            <button type="submit"><Plus size={16} /> Upsert model config</button>
+          </form>
+          <Table rows={workspaceModelConfigs} columns={['provider', 'modelPattern', 'enabled', 'maxTokens', 'status']} />
         </Panel>
 
         <Panel title="Gateway API Keys" icon={<KeyRound />}>
@@ -544,11 +724,19 @@ function App() {
               <option value="">Select user</option>
               {users.map((user) => <option key={user.id} value={user.id}>{user.email}</option>)}
             </select>
+            <select name="workspaceId">
+              <option value="">Auto-select user workspace</option>
+              {workspaces.map((workspace) => (
+                <option key={workspace.workspace_id} value={workspace.workspace_id}>
+                  {workspace.workspace_name}
+                </option>
+              ))}
+            </select>
             <input name="name" placeholder="Key name" required />
             <input name="rateLimitPerMinute" type="number" defaultValue="60" min="1" required />
             <button><Plus size={16} /> Create key</button>
           </form>
-          <Table rows={apiKeys} columns={['name', 'keyPrefix', 'status', 'rateLimitPerMinute']} />
+          <Table rows={apiKeys} columns={['name', 'workspaceId', 'keyPrefix', 'status', 'rateLimitPerMinute']} />
         </Panel>
 
         <Panel title="Provider Keys" icon={<Database />}>

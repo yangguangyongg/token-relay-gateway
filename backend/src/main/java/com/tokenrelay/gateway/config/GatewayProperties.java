@@ -9,6 +9,8 @@ public record GatewayProperties(
     String adminApiKey,
     String adminJwtSecret,
     long adminJwtTtlSeconds,
+    String workspaceJwtSecret,
+    long workspaceJwtTtlSeconds,
     String adminBootstrapAdminUsername,
     String adminBootstrapAdminPassword,
     String adminBootstrapViewerUsername,
@@ -25,5 +27,9 @@ public record GatewayProperties(
 
   public Duration adminJwtTtl() {
     return Duration.ofSeconds(adminJwtTtlSeconds <= 0 ? 3600 : adminJwtTtlSeconds);
+  }
+
+  public Duration workspaceJwtTtl() {
+    return Duration.ofSeconds(workspaceJwtTtlSeconds <= 0 ? 86400 : workspaceJwtTtlSeconds);
   }
 }

@@ -5,15 +5,15 @@ import java.util.UUID;
 import org.springframework.data.annotation.Id;
 import org.springframework.data.relational.core.mapping.Table;
 
-@Table("api_keys")
-public record ApiKeyRecord(
+@Table("workspace_model_configs")
+public record WorkspaceModelConfig(
     @Id UUID id,
-    UUID userId,
     UUID workspaceId,
-    String name,
-    String keyPrefix,
-    String keyHash,
+    String provider,
+    String modelPattern,
+    boolean enabled,
+    Integer maxTokens,
     String status,
-    int rateLimitPerMinute,
+    UUID createdByUserId,
     Instant createdAt,
-    Instant lastUsedAt) {}
+    Instant updatedAt) {}

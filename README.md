@@ -29,6 +29,7 @@ ADMIN_BOOTSTRAP_ADMIN_USERNAME=admin
 ADMIN_BOOTSTRAP_ADMIN_PASSWORD=<strong-password>
 ADMIN_BOOTSTRAP_VIEWER_USERNAME=viewer
 ADMIN_BOOTSTRAP_VIEWER_PASSWORD=<strong-password>
+WORKSPACE_JWT_SECRET=<base64-encoded 32-byte secret>
 ADMIN_IP_WHITELIST=127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
 ```
 
@@ -80,6 +81,53 @@ X-Client-Region: NZ
 - `POST /api/me/provider-keys`
 - `POST /api/me/provider-keys/{id}`
 - `POST /api/me/provider-keys/{id}/check`
+
+## 用户与组织（Workspace）管理
+
+当前版本新增了“用户邮箱密码登录 + workspace + 成员 RBAC”能力，并保持 Token Relay Admin 后台独立。
+
+- Token Relay Admin：仍然只有平台管理员（你）通过 `/api/admin/auth/login` 登录并做全局配置。
+- Workspace Console：业务用户通过邮箱密码登录后管理自己的 workspace。
+
+### Workspace 用户认证
+
+- `POST /api/workspace/auth/register`
+  - 入参：`email`, `password`, `displayName`, `workspaceName`
+  - 行为：创建用户、创建默认 workspace、写入 OWNER 成员关系并返回 workspace JWT
+- `POST /api/workspace/auth/login`
+- `GET /api/workspace/auth/me`
+
+### Workspace 与 RBAC
+
+- 角色：`OWNER`, `ADMIN`, `MEMBER`
+- 管控规则（当前实现）：
+  - `OWNER` / `ADMIN`：可创建 workspace API key、查看 workspace 账单、配置 workspace 模型策略、管理成员
+  - `MEMBER`：无上述管理权限
+
+### Workspace 业务接口
+
+- `GET /api/workspace/workspaces`
+- `POST /api/workspace/workspaces`
+- `GET /api/workspace/workspaces/{workspaceId}/members`
+- `POST /api/workspace/workspaces/{workspaceId}/members`
+- `GET /api/workspace/workspaces/{workspaceId}/api-keys`
+- `POST /api/workspace/workspaces/{workspaceId}/api-keys`
+- `GET /api/workspace/workspaces/{workspaceId}/billing?month=YYYY-MM`
+- `GET /api/workspace/workspaces/{workspaceId}/model-configs`
+- `POST /api/workspace/workspaces/{workspaceId}/model-configs`
+
+### Workspace 模型策略（Model Policy）
+
+可以按 workspace 为模型设置：
+
+- `provider` + `modelPattern`（支持 `gpt-4o-mini` 或 `gpt-4o*`）
+- `enabled`
+- `maxTokens`
+
+网关调用时会进行 workspace 策略校验：
+
+- 模型被禁用时拒绝请求
+- 请求 `max_tokens` 超过 workspace 上限时拒绝请求
 
 ## API Examples
 
@@ -154,6 +202,10 @@ curl -N http://localhost:8080/v1/chat/completions \
 - Admin login with JWT session and RBAC (`ADMIN`, `VIEWER`)
 - Admin IP allow-list check
 - Admin APIs for users, gateway API keys, provider keys, usage summary, audit logs
+- Workspace user registration/login with email+password and workspace JWT
+- Workspace/member management and RBAC (`OWNER`, `ADMIN`, `MEMBER`)
+- Workspace-scoped API key management, billing query, and model policy config
+- Platform admin APIs to view/update all workspaces, members, and workspace model configs
 - Provider management with BYOK ownership, priority, health checks, and fallback
 - Real token metering from provider usage fields (with fallback estimation)
 - Model pricing table and per-request estimated cost accounting

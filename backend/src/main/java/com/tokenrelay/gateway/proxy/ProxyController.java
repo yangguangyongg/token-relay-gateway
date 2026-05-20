@@ -13,6 +13,7 @@ import com.tokenrelay.gateway.service.ModelPricingService;
 import com.tokenrelay.gateway.service.QuotaService;
 import com.tokenrelay.gateway.service.RateLimitService;
 import com.tokenrelay.gateway.service.UsageMeteringService;
+import com.tokenrelay.gateway.service.WorkspaceModelPolicyService;
 import java.util.UUID;
 import java.math.BigDecimal;
 import java.util.List;
@@ -38,6 +39,7 @@ public class ProxyController {
   private final UsageMeteringService usageMeteringService;
   private final ModelPricingService modelPricingService;
   private final BillingControlService billingControlService;
+  private final WorkspaceModelPolicyService workspaceModelPolicyService;
   private final ObjectMapper objectMapper;
 
   public ProxyController(
@@ -50,6 +52,7 @@ public class ProxyController {
       UsageMeteringService usageMeteringService,
       ModelPricingService modelPricingService,
       BillingControlService billingControlService,
+      WorkspaceModelPolicyService workspaceModelPolicyService,
       ObjectMapper objectMapper) {
     this.authService = authService;
     this.complianceService = complianceService;
@@ -60,6 +63,7 @@ public class ProxyController {
     this.usageMeteringService = usageMeteringService;
     this.modelPricingService = modelPricingService;
     this.billingControlService = billingControlService;
+    this.workspaceModelPolicyService = workspaceModelPolicyService;
     this.objectMapper = objectMapper;
   }
 
@@ -68,6 +72,7 @@ public class ProxyController {
     String requestId = UUID.randomUUID().toString();
     return authService.authenticate(exchange)
         .flatMap(context -> complianceService.check(exchange).thenReturn(context))
+        .flatMap(context -> workspaceModelPolicyService.validate(context.workspace().id(), request).thenReturn(context))
         .flatMap(context -> rateLimitService.check(context.apiKey()).thenReturn(context))
         .flatMap(context -> quotaService.reserve(context).thenReturn(context))
         .flatMap(context -> routeWithFallback(context, request, requestId));
@@ -99,6 +104,7 @@ public class ProxyController {
               .header("X-Request-Id", requestId)
               .header("X-Provider", candidate.providerKey().provider())
               .header("X-Provider-Scope", candidate.byokScope() ? "USER_BYOK" : "PLATFORM_SHARED")
+              .header("X-Workspace-Id", context.workspace().id().toString())
               .contentType(response.getHeaders().getContentType() == null ? MediaType.APPLICATION_JSON : response.getHeaders().getContentType())
               .body(body);
         })

@@ -9,4 +9,6 @@ import reactor.core.publisher.Mono;
 public interface ApiKeyRepository extends ReactiveCrudRepository<ApiKeyRecord, UUID> {
   Mono<ApiKeyRecord> findByKeyHash(String keyHash);
   Flux<ApiKeyRecord> findByUserId(UUID userId);
+  Flux<ApiKeyRecord> findByWorkspaceId(UUID workspaceId);
+  Flux<ApiKeyRecord> findByWorkspaceIdAndStatus(UUID workspaceId, String status);
 }

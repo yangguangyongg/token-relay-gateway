@@ -5,6 +5,8 @@ import com.tokenrelay.gateway.domain.ApiKeyRecord;
 import com.tokenrelay.gateway.domain.AuditLog;
 import com.tokenrelay.gateway.domain.GatewayUser;
 import com.tokenrelay.gateway.domain.ProviderKey;
+import com.tokenrelay.gateway.repository.WorkspaceMembershipRepository;
+import com.tokenrelay.gateway.repository.WorkspaceRepository;
 import com.tokenrelay.gateway.repository.ApiKeyRepository;
 import com.tokenrelay.gateway.repository.AuditLogRepository;
 import com.tokenrelay.gateway.repository.GatewayUserRepository;
@@ -12,8 +14,11 @@ import com.tokenrelay.gateway.repository.ProviderKeyRepository;
 import com.tokenrelay.gateway.service.AuditService;
 import com.tokenrelay.gateway.service.GatewayException;
 import com.tokenrelay.gateway.service.HashService;
+import com.tokenrelay.gateway.service.PasswordHashService;
 import com.tokenrelay.gateway.service.ProviderHealthCheckService;
 import com.tokenrelay.gateway.service.ProviderKeySecurityService;
+import com.tokenrelay.gateway.service.WorkspaceAccessService;
+import com.tokenrelay.gateway.workspace.WorkspaceRole;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
@@ -53,10 +58,14 @@ public class AdminController {
   private final GatewayUserRepository users;
   private final ApiKeyRepository apiKeys;
   private final ProviderKeyRepository providerKeys;
+  private final WorkspaceRepository workspaces;
+  private final WorkspaceMembershipRepository memberships;
   private final AuditLogRepository auditLogs;
   private final HashService hashService;
+  private final PasswordHashService passwordHashService;
   private final ProviderKeySecurityService providerKeySecurity;
   private final ProviderHealthCheckService providerHealthCheckService;
+  private final WorkspaceAccessService workspaceAccessService;
   private final AuditService auditService;
   private final DatabaseClient databaseClient;
   private final SecureRandom secureRandom = new SecureRandom();
@@ -65,19 +74,27 @@ public class AdminController {
       GatewayUserRepository users,
       ApiKeyRepository apiKeys,
       ProviderKeyRepository providerKeys,
+      WorkspaceRepository workspaces,
+      WorkspaceMembershipRepository memberships,
       AuditLogRepository auditLogs,
       HashService hashService,
+      PasswordHashService passwordHashService,
       ProviderKeySecurityService providerKeySecurity,
       ProviderHealthCheckService providerHealthCheckService,
+      WorkspaceAccessService workspaceAccessService,
       AuditService auditService,
       R2dbcEntityTemplate template) {
     this.users = users;
     this.apiKeys = apiKeys;
     this.providerKeys = providerKeys;
+    this.workspaces = workspaces;
+    this.memberships = memberships;
     this.auditLogs = auditLogs;
     this.hashService = hashService;
+    this.passwordHashService = passwordHashService;
     this.providerKeySecurity = providerKeySecurity;
     this.providerHealthCheckService = providerHealthCheckService;
+    this.workspaceAccessService = workspaceAccessService;
     this.auditService = auditService;
     this.databaseClient = template.getDatabaseClient();
   }
@@ -88,15 +105,26 @@ public class AdminController {
   }
 
   @GetMapping("/admin/users")
-  public Flux<GatewayUser> users(ServerWebExchange exchange) {
-    return users.findAll();
+  public Flux<UserView> users(ServerWebExchange exchange) {
+    return users.findAll().map(this::toUserView);
   }
 
   @PostMapping("/admin/users")
-  public Mono<GatewayUser> createUser(ServerWebExchange exchange, @Valid @RequestBody CreateUserRequest request) {
+  public Mono<UserView> createUser(ServerWebExchange exchange, @Valid @RequestBody CreateUserRequest request) {
     String actor = currentAdmin(exchange).username();
-    GatewayUser user = new GatewayUser(null, request.email(), request.displayName(), "ACTIVE", request.monthlyTokenQuota(), null);
+    GatewayUser user = new GatewayUser(
+        null,
+        normalizeEmail(request.email()),
+        request.displayName().trim(),
+        "ACTIVE",
+        request.monthlyTokenQuota() <= 0 ? 1_000_000L : request.monthlyTokenQuota(),
+        request.password() == null || request.password().isBlank() ? null : passwordHashService.hash(request.password()),
+        null,
+        Instant.now());
     return users.save(user)
+        .flatMap(saved -> workspaces.save(workspaceAccessService.newWorkspace(saved.displayName() + " Workspace", saved.id()))
+            .flatMap(workspace -> memberships.save(workspaceAccessService.newMembership(workspace.id(), saved.id(), WorkspaceRole.OWNER))
+                .thenReturn(saved)))
         .flatMap(saved -> databaseClient.sql("""
             INSERT INTO user_billing_policies (user_id, currency, monthly_budget_usd, alert_threshold_percent, auto_disable_api_keys, status)
             VALUES (:user_id, 'USD', 0, 80, false, 'ACTIVE')
@@ -106,7 +134,8 @@ public class AdminController {
             .fetch()
             .rowsUpdated()
             .thenReturn(saved))
-        .flatMap(saved -> auditService.log(actor, "CREATE_USER", saved.id().toString(), saved.email()).thenReturn(saved));
+        .flatMap(saved -> auditService.log(actor, "CREATE_USER", saved.id().toString(), saved.email()).thenReturn(saved))
+        .map(this::toUserView);
   }
 
   @GetMapping("/admin/api-keys")
@@ -119,20 +148,24 @@ public class AdminController {
       ServerWebExchange exchange,
       @Valid @RequestBody CreateApiKeyRequest request) {
     String actor = currentAdmin(exchange).username();
-    String rawKey = "tg_" + randomHex(32);
-    ApiKeyRecord key = new ApiKeyRecord(
-        null,
-        request.userId(),
-        request.name(),
-        rawKey.substring(0, 10),
-        hashService.sha256(rawKey),
-        "ACTIVE",
-        request.rateLimitPerMinute(),
-        null,
-        null);
-    return apiKeys.save(key)
-        .flatMap(saved -> auditService.log(actor, "CREATE_API_KEY", saved.id().toString(), saved.keyPrefix()).thenReturn(saved))
-        .map(saved -> ResponseEntity.ok(new CreateApiKeyResponse(saved, rawKey)));
+    return resolveWorkspaceForApiKeyCreation(request.userId(), request.workspaceId())
+        .flatMap(workspaceId -> {
+          String rawKey = "tg_" + randomHex(32);
+          ApiKeyRecord key = new ApiKeyRecord(
+              null,
+              request.userId(),
+              workspaceId,
+              request.name(),
+              rawKey.substring(0, 10),
+              hashService.sha256(rawKey),
+              "ACTIVE",
+              request.rateLimitPerMinute(),
+              null,
+              null);
+          return apiKeys.save(key)
+              .flatMap(saved -> auditService.log(actor, "CREATE_API_KEY", saved.id().toString(), saved.keyPrefix()).thenReturn(saved))
+              .map(saved -> ResponseEntity.ok(new CreateApiKeyResponse(saved, rawKey)));
+        });
   }
 
   @GetMapping("/admin/provider-keys")
@@ -532,9 +565,49 @@ public class AdminController {
     return trimmed.isEmpty() ? null : trimmed;
   }
 
-  public record CreateUserRequest(@Email String email, @NotBlank String displayName, long monthlyTokenQuota) {}
+  private Mono<UUID> resolveWorkspaceForApiKeyCreation(UUID userId, UUID workspaceId) {
+    if (userId == null) {
+      return Mono.error(new GatewayException(400, "invalid_user_id", "userId is required"));
+    }
+    if (workspaceId != null) {
+      return memberships.findByWorkspaceIdAndUserIdAndStatus(workspaceId, userId, "ACTIVE")
+          .switchIfEmpty(Mono.error(new GatewayException(400, "workspace_membership_missing", "user is not an active member of workspace")))
+          .then(workspaceAccessService.requireActiveWorkspace(workspaceId))
+          .map(workspace -> workspace.id());
+    }
+    return memberships.findByUserIdAndStatus(userId, "ACTIVE")
+        .next()
+        .map(membership -> membership.workspaceId())
+        .switchIfEmpty(Mono.error(new GatewayException(400, "workspace_missing", "No active workspace found for user")));
+  }
 
-  public record CreateApiKeyRequest(UUID userId, @NotBlank String name, int rateLimitPerMinute) {}
+  private String normalizeEmail(String email) {
+    if (email == null || email.isBlank()) {
+      throw new GatewayException(400, "invalid_email", "email is required");
+    }
+    return email.trim().toLowerCase(Locale.ROOT);
+  }
+
+  public record CreateUserRequest(
+      @Email String email,
+      @NotBlank String displayName,
+      long monthlyTokenQuota,
+      String password) {}
+
+  public record UserView(
+      UUID id,
+      String email,
+      String displayName,
+      String status,
+      long monthlyTokenQuota,
+      Instant createdAt,
+      Instant updatedAt) {}
+
+  public record CreateApiKeyRequest(
+      UUID userId,
+      UUID workspaceId,
+      @NotBlank String name,
+      int rateLimitPerMinute) {}
 
   public record CreateApiKeyResponse(ApiKeyRecord apiKey, String rawKey) {}
 
@@ -604,5 +677,16 @@ public class AdminController {
         key.lastError(),
         key.createdAt(),
         key.updatedAt());
+  }
+
+  private UserView toUserView(GatewayUser user) {
+    return new UserView(
+        user.id(),
+        user.email(),
+        user.displayName(),
+        user.status(),
+        user.monthlyTokenQuota(),
+        user.createdAt(),
+        user.updatedAt());
   }
 }

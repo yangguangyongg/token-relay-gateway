@@ -12,4 +12,6 @@ public record GatewayUser(
     String displayName,
     String status,
     long monthlyTokenQuota,
-    Instant createdAt) {}
+    String passwordHash,
+    Instant createdAt,
+    Instant updatedAt) {}

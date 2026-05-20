@@ -162,6 +162,7 @@ public class BillingControlService {
     return new ApiKeyRecord(
         key.id(),
         key.userId(),
+        key.workspaceId(),
         key.name(),
         key.keyPrefix(),
         key.keyHash(),
