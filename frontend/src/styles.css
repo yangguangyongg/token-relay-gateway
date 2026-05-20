@@ -200,7 +200,7 @@ button:active {
 }
 
 .panel-note {
-  margin: 0;
+  margin: 0 0 12px;
   color: #475569;
   font-size: 14px;
 }

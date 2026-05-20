@@ -93,9 +93,25 @@ X-Client-Region: NZ
 
 - `POST /api/workspace/auth/register`
   - 入参：`email`, `password`, `displayName`, `workspaceName`
-  - 行为：创建用户、创建默认 workspace、写入 OWNER 成员关系并返回 workspace JWT
+  - 行为：用于个人用户自助注册，创建用户、创建 `PERSONAL` 类型 workspace、写入 OWNER 成员关系并返回 workspace JWT
 - `POST /api/workspace/auth/login`
 - `GET /api/workspace/auth/me`
+
+### 用户创建与 Workspace 分配
+
+- `POST /api/admin/users`
+  - 支持 `provisioningMode`
+  - `USER_ONLY`：只创建用户账号，不自动创建 workspace
+  - `ADD_TO_WORKSPACE`：创建用户并直接加入现有 workspace
+  - `CREATE_WORKSPACE`：创建用户并同时创建新 workspace（可指定 `PERSONAL` / `ORGANIZATION`）
+- `POST /api/admin/workspaces`
+  - 平台管理员创建一个新的 workspace，并指定初始 owner
+
+当前推荐规则：
+
+- 团队/公司场景：先建 `ORGANIZATION` workspace，再把成员加入该 workspace
+- 独立个人场景：走自助注册或管理员创建 `PERSONAL` workspace
+- 用户账号和 workspace 已解耦，批量创建用户不会再自动生成一批默认 workspace
 
 ### Workspace 与 RBAC
 
@@ -153,20 +169,29 @@ curl -N http://localhost:8080/v1/chat/completions \
    打开 `http://localhost:8080`，使用 `.env` 里的管理员账号登录。
 
 2. 创建用户  
-   在 `Users` 面板创建用户，填写：
+   在 `Users` 面板创建用户时，先选择模式：
+   - `Create user only`：只建账号，适合先导入成员
+   - `Create user and add to existing workspace`：直接归属到已有团队
+   - `Create user and create new workspace`：适合为独立用户或新客户初始化环境
+   然后填写：
    - `email`
    - `displayName`
    - `monthlyTokenQuota`（该用户每月 token 配额）
 
-3. 为用户创建网关密钥  
+3. 创建或选择 workspace  
+   - 团队场景：在 `Workspace` 面板先创建 `ORGANIZATION` workspace，指定初始 owner
+   - 独立用户场景：可在创建用户时直接创建 `PERSONAL` workspace
+
+4. 为用户创建网关密钥  
    在 `Gateway API Keys` 面板：
    - 选择用户
+   - 选择该 key 所属的 workspace
    - 设置 `name`
    - 设置 `rateLimitPerMinute`
    - 点击创建后会返回一次明文 key（前缀通常为 `tg_`）  
    注意：该明文只在创建当下返回一次，请立即保存给用户。
 
-4. 配置上游 Provider（平台代付或统一出口）  
+5. 配置上游 Provider（平台代付或统一出口）  
    在 `Provider Keys` 面板至少添加一条可用 provider：
    - `provider`: `OPENAI` / `ANTHROPIC` / `AZURE_OPENAI` / `GEMINI`
    - `baseUrl`: 例如 OpenAI 用 `https://api.openai.com`

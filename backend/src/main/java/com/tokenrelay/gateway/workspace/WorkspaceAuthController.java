@@ -83,7 +83,10 @@ public class WorkspaceAuthController {
               now);
           return users.save(toCreate)
               .flatMap(savedUser -> {
-                Workspace workspace = workspaceAccessService.newWorkspace(workspaceName, savedUser.id());
+                Workspace workspace = workspaceAccessService.newWorkspace(
+                    workspaceName,
+                    savedUser.id(),
+                    WorkspaceAccessService.WORKSPACE_TYPE_PERSONAL);
                 return workspaces.save(workspace)
                     .flatMap(savedWorkspace -> memberships.save(
                         workspaceAccessService.newMembership(savedWorkspace.id(), savedUser.id(), WorkspaceRole.OWNER))
@@ -146,6 +149,7 @@ public class WorkspaceAuthController {
                   workspace.id(),
                   workspace.name(),
                   workspace.slug(),
+                  workspace.type(),
                   rolesByWorkspace.getOrDefault(workspace.id(), "MEMBER"),
                   workspace.status()))
               .toList();
@@ -204,6 +208,7 @@ public class WorkspaceAuthController {
       UUID workspaceId,
       String workspaceName,
       String workspaceSlug,
+      String workspaceType,
       String role,
       String workspaceStatus) {}
 

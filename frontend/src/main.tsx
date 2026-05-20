@@ -110,6 +110,7 @@ type WorkspaceRow = {
   workspace_id: string;
   workspace_name: string;
   workspace_slug: string;
+  workspace_type: string;
   workspace_status: string;
   created_at: string;
   member_count: number;
@@ -229,6 +230,7 @@ function App() {
   const [workspaceModelConfigs, setWorkspaceModelConfigs] = useState<WorkspaceModelConfigRow[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [activeTab, setActiveTab] = useState<TabKey>('overview');
+  const [userProvisioningMode, setUserProvisioningMode] = useState('USER_ONLY');
   const [message, setMessage] = useState('');
   const [rawKey, setRawKey] = useState('');
 
@@ -364,12 +366,45 @@ function App() {
   const createUser = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
+    const provisioningMode = (form.get('provisioningMode') || 'USER_ONLY').toString();
+    const passwordValue = (form.get('password') || '').toString().trim();
     await api('/api/admin/users', adminToken, {
       method: 'POST',
       body: JSON.stringify({
         email: form.get('email'),
         displayName: form.get('displayName'),
-        monthlyTokenQuota: Number(form.get('monthlyTokenQuota'))
+        monthlyTokenQuota: Number(form.get('monthlyTokenQuota')),
+        password: passwordValue || null,
+        provisioningMode,
+        workspaceId: provisioningMode === 'ADD_TO_WORKSPACE'
+          ? ((form.get('workspaceId') || '').toString() || null)
+          : null,
+        workspaceName: provisioningMode === 'CREATE_WORKSPACE'
+          ? ((form.get('workspaceName') || '').toString() || null)
+          : null,
+        workspaceType: provisioningMode === 'CREATE_WORKSPACE'
+          ? ((form.get('workspaceType') || '').toString() || null)
+          : null,
+        workspaceRole: provisioningMode === 'USER_ONLY'
+          ? null
+          : ((form.get('workspaceRole') || '').toString() || null)
+      })
+    });
+    event.currentTarget.reset();
+    setUserProvisioningMode('USER_ONLY');
+    await load();
+  };
+
+  const createWorkspace = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    await api('/api/admin/workspaces', adminToken, {
+      method: 'POST',
+      body: JSON.stringify({
+        name: form.get('name'),
+        ownerUserId: form.get('ownerUserId'),
+        type: form.get('type'),
+        ownerRole: form.get('ownerRole')
       })
     });
     event.currentTarget.reset();
@@ -706,27 +741,69 @@ function App() {
         {adminToken && activeTab === 'overview' && (
           <>
             <Panel title="Users" icon={<Users />}>
+              <p className="panel-note">Create standalone users, attach them directly to an existing workspace, or provision a brand-new personal or organization workspace only when it is actually needed.</p>
               <form onSubmit={createUser} className="form">
                 <input name="email" type="email" placeholder="email@example.com" required />
                 <input name="displayName" placeholder="Display name" required />
                 <input name="monthlyTokenQuota" type="number" defaultValue="1000000" min="1" required />
                 <input name="password" type="password" placeholder="Password (optional)" />
+                <select
+                  name="provisioningMode"
+                  value={userProvisioningMode}
+                  onChange={(event) => setUserProvisioningMode(event.target.value)}
+                  required
+                >
+                  <option value="USER_ONLY">Create user only</option>
+                  <option value="ADD_TO_WORKSPACE">Create user and add to existing workspace</option>
+                  <option value="CREATE_WORKSPACE">Create user and create new workspace</option>
+                </select>
+                {userProvisioningMode === 'ADD_TO_WORKSPACE' && (
+                  <>
+                    <select name="workspaceId" required>
+                      <option value="">Select workspace</option>
+                      {workspaces.map((workspace) => (
+                        <option key={workspace.workspace_id} value={workspace.workspace_id}>
+                          {workspace.workspace_name} ({workspace.workspace_type})
+                        </option>
+                      ))}
+                    </select>
+                    <select name="workspaceRole" defaultValue="MEMBER" required>
+                      <option value="OWNER">OWNER</option>
+                      <option value="ADMIN">ADMIN</option>
+                      <option value="MEMBER">MEMBER</option>
+                    </select>
+                  </>
+                )}
+                {userProvisioningMode === 'CREATE_WORKSPACE' && (
+                  <>
+                    <input name="workspaceName" placeholder="Workspace name" required />
+                    <select name="workspaceType" defaultValue="ORGANIZATION" required>
+                      <option value="ORGANIZATION">ORGANIZATION</option>
+                      <option value="PERSONAL">PERSONAL</option>
+                    </select>
+                    <select name="workspaceRole" defaultValue="OWNER" required>
+                      <option value="OWNER">OWNER</option>
+                      <option value="ADMIN">ADMIN</option>
+                    </select>
+                  </>
+                )}
                 <button><Plus size={16} /> Create user</button>
               </form>
               <Table rows={users} columns={['email', 'displayName', 'status', 'monthlyTokenQuota']} />
             </Panel>
 
             <Panel title="Gateway API Keys" icon={<KeyRound />}>
+              <p className="panel-note">Gateway API keys belong to a specific workspace. Pick the workspace explicitly when a user participates in more than one team.</p>
               <form onSubmit={createApiKey} className="form">
                 <select name="userId" required>
                   <option value="">Select user</option>
                   {users.map((user) => <option key={user.id} value={user.id}>{user.email}</option>)}
                 </select>
-                <select name="workspaceId">
-                  <option value="">Auto-select user workspace</option>
+                <select name="workspaceId" required>
+                  <option value="">Select workspace</option>
                   {workspaces.map((workspace) => (
                     <option key={workspace.workspace_id} value={workspace.workspace_id}>
-                      {workspace.workspace_name}
+                      {workspace.workspace_name} ({workspace.workspace_type})
                     </option>
                   ))}
                 </select>
@@ -772,6 +849,26 @@ function App() {
 
         {adminToken && activeTab === 'workspace' && (
           <>
+            <Panel title="Create Workspace" icon={<Users />}>
+              <p className="panel-note">Create organization or personal workspaces only when there is a real billing and permission boundary to manage.</p>
+              <form onSubmit={createWorkspace} className="form">
+                <input name="name" placeholder="Workspace name" required />
+                <select name="type" defaultValue="ORGANIZATION" required>
+                  <option value="ORGANIZATION">ORGANIZATION</option>
+                  <option value="PERSONAL">PERSONAL</option>
+                </select>
+                <select name="ownerUserId" required>
+                  <option value="">Select initial owner</option>
+                  {users.map((user) => <option key={user.id} value={user.id}>{user.email}</option>)}
+                </select>
+                <select name="ownerRole" defaultValue="OWNER" required>
+                  <option value="OWNER">OWNER</option>
+                  <option value="ADMIN">ADMIN</option>
+                </select>
+                <button type="submit"><Plus size={16} /> Create workspace</button>
+              </form>
+            </Panel>
+
             <Panel title="Workspaces" icon={<Users />}>
               <form onSubmit={refreshSelectedWorkspace} className="form">
                 <select value={selectedWorkspaceId} onChange={(event) => setSelectedWorkspaceId(event.target.value)} required>
@@ -785,12 +882,13 @@ function App() {
                 <button type="submit">
                   <RefreshCw size={16} />
                   Load workspace config
-                </button>
+                  </button>
               </form>
-              <Table rows={workspaces} columns={['workspace_name', 'workspace_slug', 'workspace_status', 'member_count', 'active_key_count']} />
+              <Table rows={workspaces} columns={['workspace_name', 'workspace_type', 'workspace_slug', 'workspace_status', 'member_count', 'active_key_count']} />
             </Panel>
 
             <Panel title="Workspace Members" icon={<Users />}>
+              <p className="panel-note">Add an existing user by email, or create the user from the Overview tab with the “add to existing workspace” option.</p>
               <form onSubmit={upsertWorkspaceMember} className="form">
                 <input name="userEmail" type="email" placeholder="member email" required />
                 <select name="role" defaultValue="ADMIN" required>

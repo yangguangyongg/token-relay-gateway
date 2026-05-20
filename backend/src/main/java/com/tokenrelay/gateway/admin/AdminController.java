@@ -5,6 +5,7 @@ import com.tokenrelay.gateway.domain.ApiKeyRecord;
 import com.tokenrelay.gateway.domain.AuditLog;
 import com.tokenrelay.gateway.domain.GatewayUser;
 import com.tokenrelay.gateway.domain.ProviderKey;
+import com.tokenrelay.gateway.domain.WorkspaceMembership;
 import com.tokenrelay.gateway.repository.WorkspaceMembershipRepository;
 import com.tokenrelay.gateway.repository.WorkspaceRepository;
 import com.tokenrelay.gateway.repository.ApiKeyRepository;
@@ -122,9 +123,7 @@ public class AdminController {
         null,
         Instant.now());
     return users.save(user)
-        .flatMap(saved -> workspaces.save(workspaceAccessService.newWorkspace(saved.displayName() + " Workspace", saved.id()))
-            .flatMap(workspace -> memberships.save(workspaceAccessService.newMembership(workspace.id(), saved.id(), WorkspaceRole.OWNER))
-                .thenReturn(saved)))
+        .flatMap(saved -> provisionUserAccess(saved, request).thenReturn(saved))
         .flatMap(saved -> databaseClient.sql("""
             INSERT INTO user_billing_policies (user_id, currency, monthly_budget_usd, alert_threshold_percent, auto_disable_api_keys, status)
             VALUES (:user_id, 'USD', 0, 80, false, 'ACTIVE')
@@ -565,6 +564,73 @@ public class AdminController {
     return trimmed.isEmpty() ? null : trimmed;
   }
 
+  private Mono<Void> provisionUserAccess(GatewayUser user, CreateUserRequest request) {
+    String mode = normalizeUserProvisioningMode(request.provisioningMode());
+    return switch (mode) {
+      case "USER_ONLY" -> Mono.empty();
+      case "ADD_TO_WORKSPACE" -> addUserToExistingWorkspace(user, request);
+      case "CREATE_WORKSPACE" -> createWorkspaceForUser(user, request);
+      default -> Mono.error(new GatewayException(400, "invalid_user_provisioning_mode", "Unsupported provisioning mode"));
+    };
+  }
+
+  private Mono<Void> addUserToExistingWorkspace(GatewayUser user, CreateUserRequest request) {
+    if (request.workspaceId() == null) {
+      return Mono.error(new GatewayException(400, "workspace_id_required", "workspaceId is required when adding a user to an existing workspace"));
+    }
+    UUID workspaceId = request.workspaceId();
+    String role = normalizeMembershipRoleForProvisioning(request.workspaceRole(), false);
+    return workspaceAccessService.requireActiveWorkspace(workspaceId)
+        .then(memberships.findByWorkspaceIdAndUserId(workspaceId, user.id())
+            .defaultIfEmpty(new WorkspaceMembership(
+                null,
+                workspaceId,
+                user.id(),
+                role,
+                "ACTIVE",
+                Instant.now(),
+                Instant.now()))
+            .flatMap(existing -> memberships.save(new WorkspaceMembership(
+                existing.id(),
+                workspaceId,
+                user.id(),
+                role,
+                "ACTIVE",
+                existing.createdAt() == null ? Instant.now() : existing.createdAt(),
+                Instant.now())))
+            .then());
+  }
+
+  private Mono<Void> createWorkspaceForUser(GatewayUser user, CreateUserRequest request) {
+    String workspaceName = blankToNull(request.workspaceName());
+    if (workspaceName == null) {
+      return Mono.error(new GatewayException(400, "workspace_name_required", "workspaceName is required when creating a workspace"));
+    }
+    String workspaceType = workspaceAccessService.normalizeWorkspaceType(request.workspaceType());
+    String role = normalizeMembershipRoleForProvisioning(request.workspaceRole(), true);
+    WorkspaceRole workspaceRole = WorkspaceRole.parse(role);
+    return workspaces.save(workspaceAccessService.newWorkspace(workspaceName, user.id(), workspaceType))
+        .flatMap(workspace -> memberships.save(workspaceAccessService.newMembership(workspace.id(), user.id(), workspaceRole)).then());
+  }
+
+  private String normalizeUserProvisioningMode(String raw) {
+    if (raw == null || raw.isBlank()) {
+      return "USER_ONLY";
+    }
+    String normalized = raw.trim().toUpperCase(Locale.ROOT);
+    return switch (normalized) {
+      case "USER_ONLY", "ADD_TO_WORKSPACE", "CREATE_WORKSPACE" -> normalized;
+      default -> throw new GatewayException(400, "invalid_user_provisioning_mode", "provisioningMode must be USER_ONLY, ADD_TO_WORKSPACE, or CREATE_WORKSPACE");
+    };
+  }
+
+  private String normalizeMembershipRoleForProvisioning(String rawRole, boolean workspaceCreation) {
+    if (rawRole == null || rawRole.isBlank()) {
+      return workspaceCreation ? WorkspaceRole.OWNER.name() : WorkspaceRole.MEMBER.name();
+    }
+    return workspaceAccessService.normalizeWorkspaceRole(rawRole);
+  }
+
   private Mono<UUID> resolveWorkspaceForApiKeyCreation(UUID userId, UUID workspaceId) {
     if (userId == null) {
       return Mono.error(new GatewayException(400, "invalid_user_id", "userId is required"));
@@ -576,9 +642,16 @@ public class AdminController {
           .map(workspace -> workspace.id());
     }
     return memberships.findByUserIdAndStatus(userId, "ACTIVE")
-        .next()
-        .map(membership -> membership.workspaceId())
-        .switchIfEmpty(Mono.error(new GatewayException(400, "workspace_missing", "No active workspace found for user")));
+        .collectList()
+        .flatMap(activeMemberships -> {
+          if (activeMemberships.isEmpty()) {
+            return Mono.error(new GatewayException(400, "workspace_missing", "No active workspace found for user"));
+          }
+          if (activeMemberships.size() > 1) {
+            return Mono.error(new GatewayException(400, "workspace_selection_required", "workspaceId is required when the user belongs to multiple workspaces"));
+          }
+          return Mono.just(activeMemberships.get(0).workspaceId());
+        });
   }
 
   private String normalizeEmail(String email) {
@@ -592,7 +665,12 @@ public class AdminController {
       @Email String email,
       @NotBlank String displayName,
       long monthlyTokenQuota,
-      String password) {}
+      String password,
+      String provisioningMode,
+      UUID workspaceId,
+      String workspaceName,
+      String workspaceType,
+      String workspaceRole) {}
 
   public record UserView(
       UUID id,

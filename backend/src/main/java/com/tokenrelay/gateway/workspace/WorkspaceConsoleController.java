@@ -85,6 +85,7 @@ public class WorkspaceConsoleController {
                     workspace.id(),
                     workspace.name(),
                     workspace.slug(),
+                    workspace.type(),
                     workspace.status(),
                     membership.role()))));
   }
@@ -95,7 +96,10 @@ public class WorkspaceConsoleController {
       @Valid @RequestBody CreateWorkspaceRequest request) {
     return workspaceSessionService.authenticate(exchange)
         .flatMap(user -> {
-          Workspace workspace = workspaceAccessService.newWorkspace(request.name(), user.id());
+          Workspace workspace = workspaceAccessService.newWorkspace(
+              request.name(),
+              user.id(),
+              request.type());
           return workspaces.save(workspace)
               .flatMap(savedWorkspace -> memberships.save(
                   workspaceAccessService.newMembership(savedWorkspace.id(), user.id(), WorkspaceRole.OWNER))
@@ -103,6 +107,7 @@ public class WorkspaceConsoleController {
                       savedWorkspace.id(),
                       savedWorkspace.name(),
                       savedWorkspace.slug(),
+                      savedWorkspace.type(),
                       savedWorkspace.status(),
                       WorkspaceRole.OWNER.name())));
         });
@@ -341,10 +346,11 @@ public class WorkspaceConsoleController {
       UUID workspaceId,
       String name,
       String slug,
+      String type,
       String status,
       String role) {}
 
-  public record CreateWorkspaceRequest(@NotBlank String name) {}
+  public record CreateWorkspaceRequest(@NotBlank String name, String type) {}
 
   public record MemberView(
       UUID membershipId,

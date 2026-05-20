@@ -14,6 +14,8 @@ import reactor.core.publisher.Mono;
 
 @Service
 public class WorkspaceAccessService {
+  public static final String WORKSPACE_TYPE_PERSONAL = "PERSONAL";
+  public static final String WORKSPACE_TYPE_ORGANIZATION = "ORGANIZATION";
   private static final Set<WorkspaceRole> MANAGER_ROLES = Set.of(WorkspaceRole.OWNER, WorkspaceRole.ADMIN);
 
   private final WorkspaceRepository workspaces;
@@ -49,7 +51,7 @@ public class WorkspaceAccessService {
         });
   }
 
-  public Workspace newWorkspace(String name, UUID createdByUserId) {
+  public Workspace newWorkspace(String name, UUID createdByUserId, String type) {
     String trimmedName = name == null ? "" : name.trim();
     if (trimmedName.isBlank()) {
       throw new GatewayException(400, "workspace_name_required", "workspace name is required");
@@ -59,6 +61,7 @@ public class WorkspaceAccessService {
         null,
         trimmedName,
         slug,
+        normalizeWorkspaceType(type),
         "ACTIVE",
         createdByUserId,
         Instant.now(),
@@ -85,6 +88,17 @@ public class WorkspaceAccessService {
     } catch (IllegalArgumentException ex) {
       throw new GatewayException(400, "invalid_workspace_role", "role must be OWNER/ADMIN/MEMBER");
     }
+  }
+
+  public String normalizeWorkspaceType(String raw) {
+    if (raw == null || raw.isBlank()) {
+      return WORKSPACE_TYPE_ORGANIZATION;
+    }
+    String normalized = raw.trim().toUpperCase(Locale.ROOT);
+    return switch (normalized) {
+      case WORKSPACE_TYPE_PERSONAL, WORKSPACE_TYPE_ORGANIZATION -> normalized;
+      default -> throw new GatewayException(400, "invalid_workspace_type", "workspace type must be PERSONAL or ORGANIZATION");
+    };
   }
 
   private String slugify(String input) {

@@ -12,6 +12,7 @@ import com.tokenrelay.gateway.repository.WorkspaceRepository;
 import com.tokenrelay.gateway.service.AuditService;
 import com.tokenrelay.gateway.service.GatewayException;
 import com.tokenrelay.gateway.service.WorkspaceAccessService;
+import com.tokenrelay.gateway.workspace.WorkspaceRole;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import java.time.Instant;
@@ -68,6 +69,7 @@ public class WorkspaceAdminController {
           w.id::text AS workspace_id,
           w.name AS workspace_name,
           w.slug AS workspace_slug,
+          w.type AS workspace_type,
           w.status AS workspace_status,
           w.created_at AS created_at,
           coalesce(m.member_count, 0) AS member_count,
@@ -89,6 +91,25 @@ public class WorkspaceAdminController {
         """)
         .fetch()
         .all();
+  }
+
+  @PostMapping
+  public Mono<Workspace> createWorkspace(
+      ServerWebExchange exchange,
+      @Valid @RequestBody CreateWorkspaceRequest request) {
+    String actor = currentAdmin(exchange).username();
+    return users.findById(request.parsedOwnerUserId())
+        .switchIfEmpty(Mono.error(new GatewayException(404, "owner_user_not_found", "ownerUserId does not exist")))
+        .flatMap(ownerUser -> workspaces.save(workspaceAccessService.newWorkspace(
+                request.name(),
+                ownerUser.id(),
+                request.type()))
+            .flatMap(workspace -> memberships.save(workspaceAccessService.newMembership(
+                    workspace.id(),
+                    ownerUser.id(),
+                    WorkspaceRole.parse(normalizeRole(request.ownerRole(), "OWNER"))))
+                .then(auditService.log(actor, "ADMIN_CREATE_WORKSPACE", workspace.id().toString(), workspace.name()))
+                .thenReturn(workspace)));
   }
 
   @GetMapping("/{workspaceId}/members")
@@ -253,6 +274,13 @@ public class WorkspaceAdminController {
     };
   }
 
+  private String normalizeRole(String role, String fallback) {
+    if (role == null || role.isBlank()) {
+      return fallback;
+    }
+    return workspaceAccessService.normalizeWorkspaceRole(role);
+  }
+
   private YearMonth resolveMonth(String rawMonth) {
     if (rawMonth == null || rawMonth.isBlank()) {
       return YearMonth.now(ZoneOffset.UTC);
@@ -276,6 +304,20 @@ public class WorkspaceAdminController {
       @NotBlank String userEmail,
       @NotBlank String role,
       String status) {}
+
+  public record CreateWorkspaceRequest(
+      @NotBlank String name,
+      @NotBlank String ownerUserId,
+      String type,
+      String ownerRole) {
+    public UUID parsedOwnerUserId() {
+      try {
+        return UUID.fromString(ownerUserId);
+      } catch (IllegalArgumentException ex) {
+        throw new GatewayException(400, "invalid_owner_user_id", "ownerUserId must be a valid UUID");
+      }
+    }
+  }
 
   public record UpsertModelConfigRequest(
       @NotBlank String provider,

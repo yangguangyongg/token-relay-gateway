@@ -10,6 +10,7 @@ public record Workspace(
     @Id UUID id,
     String name,
     String slug,
+    String type,
     String status,
     UUID createdByUserId,
     Instant createdAt,
