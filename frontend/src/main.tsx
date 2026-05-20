@@ -151,7 +151,15 @@ type LoginResponse = {
 
 type TabKey = 'overview' | 'workspace' | 'providers' | 'billing' | 'audit';
 
+type StoredAdminSession = {
+  accessToken: string;
+  username: string;
+  roles: string[];
+  expiresAt: number;
+};
+
 const currentMonthValue = () => new Date().toISOString().slice(0, 7);
+const ADMIN_SESSION_STORAGE_KEY = 'token-relay-admin-session';
 
 const usageDetailsPath = (month: string, userId: string) => {
   const params = new URLSearchParams();
@@ -188,6 +196,48 @@ const parseDownloadFileName = (contentDisposition: string | null, fallback: stri
   return simple?.[1] ?? fallback;
 };
 
+class ApiError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+const loadStoredAdminSession = (): StoredAdminSession | null => {
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  const raw = window.localStorage.getItem(ADMIN_SESSION_STORAGE_KEY);
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw) as StoredAdminSession;
+    if (!parsed.accessToken || !parsed.username || !Array.isArray(parsed.roles) || typeof parsed.expiresAt !== 'number') {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+};
+
+const persistAdminSession = (session: StoredAdminSession) => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  window.localStorage.setItem(ADMIN_SESSION_STORAGE_KEY, JSON.stringify(session));
+};
+
+const clearStoredAdminSession = () => {
+  if (typeof window === 'undefined') {
+    return;
+  }
+  window.localStorage.removeItem(ADMIN_SESSION_STORAGE_KEY);
+};
+
 const api = async <T,>(path: string, adminToken?: string, options: RequestInit = {}): Promise<T> => {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -202,7 +252,7 @@ const api = async <T,>(path: string, adminToken?: string, options: RequestInit =
   });
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(body || `Request failed: ${response.status}`);
+    throw new ApiError(response.status, body || `Request failed: ${response.status}`);
   }
   return response.json();
 };
@@ -213,6 +263,7 @@ function App() {
   const [adminToken, setAdminToken] = useState('');
   const [adminName, setAdminName] = useState('');
   const [adminRoles, setAdminRoles] = useState<string[]>([]);
+  const [adminSessionExpiresAt, setAdminSessionExpiresAt] = useState<number | null>(null);
   const [users, setUsers] = useState<User[]>([]);
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
   const [providerKeys, setProviderKeys] = useState<ProviderKey[]>([]);
@@ -242,6 +293,33 @@ function App() {
       requests: usage.reduce((sum, row) => sum + Number(row.requests), 0)
     };
   }, [users, apiKeys, providerKeys, usage]);
+
+  const adminSessionExpiryLabel = adminSessionExpiresAt == null
+    ? ''
+    : new Date(adminSessionExpiresAt).toLocaleString();
+
+  const clearAdminSession = (nextMessage: string) => {
+    clearStoredAdminSession();
+    setAdminToken('');
+    setAdminName('');
+    setAdminRoles([]);
+    setAdminSessionExpiresAt(null);
+    setUsers([]);
+    setApiKeys([]);
+    setProviderKeys([]);
+    setUsage([]);
+    setUsageDetails([]);
+    setPricingModels([]);
+    setBillingPolicies([]);
+    setMonthlyBills([]);
+    setWorkspaces([]);
+    setSelectedWorkspaceId('');
+    setWorkspaceMembers([]);
+    setWorkspaceModelConfigs([]);
+    setAuditLogs([]);
+    setRawKey('');
+    setMessage(nextMessage);
+  };
 
   const load = async (tokenOverride?: string) => {
     const token = tokenOverride ?? adminToken;
@@ -301,6 +379,10 @@ function App() {
       }
       setMessage('Ready');
     } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        clearAdminSession('Admin session expired. Please sign in again.');
+        return;
+      }
       setMessage(error instanceof Error ? error.message : 'Unknown error');
     }
   };
@@ -319,8 +401,37 @@ function App() {
   };
 
   useEffect(() => {
-    setMessage('Please login to access admin APIs');
+    const stored = loadStoredAdminSession();
+    if (!stored) {
+      setMessage('Please login to access admin APIs');
+      return;
+    }
+    if (stored.expiresAt <= Date.now()) {
+      clearStoredAdminSession();
+      setMessage('Admin session expired. Please sign in again.');
+      return;
+    }
+    setAdminToken(stored.accessToken);
+    setAdminName(stored.username);
+    setAdminRoles(stored.roles);
+    setAdminSessionExpiresAt(stored.expiresAt);
+    void load(stored.accessToken);
   }, []);
+
+  useEffect(() => {
+    if (!adminToken || adminSessionExpiresAt == null) {
+      return;
+    }
+    const remainingMs = adminSessionExpiresAt - Date.now();
+    if (remainingMs <= 0) {
+      clearAdminSession('Admin session expired. Please sign in again.');
+      return;
+    }
+    const timeoutId = window.setTimeout(() => {
+      clearAdminSession('Admin session expired. Please sign in again.');
+    }, remainingMs);
+    return () => window.clearTimeout(timeoutId);
+  }, [adminToken, adminSessionExpiresAt]);
 
   const login = async () => {
     setMessage('Signing in...');
@@ -332,9 +443,17 @@ function App() {
           password
         })
       });
+      const expiresAt = Date.now() + response.expiresInSeconds * 1000;
+      persistAdminSession({
+        accessToken: response.accessToken,
+        username: response.username,
+        roles: response.roles,
+        expiresAt
+      });
       setAdminToken(response.accessToken);
       setAdminName(response.username);
       setAdminRoles(response.roles);
+      setAdminSessionExpiresAt(expiresAt);
       setPassword('');
       await load(response.accessToken);
     } catch (error) {
@@ -343,24 +462,7 @@ function App() {
   };
 
   const logout = () => {
-    setAdminToken('');
-    setAdminName('');
-    setAdminRoles([]);
-    setUsers([]);
-    setApiKeys([]);
-    setProviderKeys([]);
-    setUsage([]);
-    setUsageDetails([]);
-    setPricingModels([]);
-    setBillingPolicies([]);
-    setMonthlyBills([]);
-    setWorkspaces([]);
-    setSelectedWorkspaceId('');
-    setWorkspaceMembers([]);
-    setWorkspaceModelConfigs([]);
-    setAuditLogs([]);
-    setRawKey('');
-    setMessage('Logged out');
+    clearAdminSession('Logged out');
   };
 
   const createUser = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -671,6 +773,7 @@ function App() {
           {adminToken && (
             <>
               <span>{adminName} ({adminRoles.join(',')})</span>
+              {adminSessionExpiryLabel && <span>Session until {adminSessionExpiryLabel}</span>}
               <button onClick={() => load()} title="Refresh dashboard">
                 <RefreshCw size={18} />
               </button>
