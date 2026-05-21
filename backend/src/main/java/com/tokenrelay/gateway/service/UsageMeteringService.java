@@ -29,6 +29,7 @@ public class UsageMeteringService {
     private final JsonNode request;
     private final ObjectMapper objectMapper;
     private final StringBuilder rawBody = new StringBuilder();
+    private final StringBuilder completionText = new StringBuilder();
     private long promptTokens = -1;
     private long completionTokens = -1;
     private long totalTokens = -1;
@@ -52,7 +53,7 @@ public class UsageMeteringService {
       captureUsageFromJsonText(rawBody.toString());
 
       long prompt = promptTokens >= 0 ? promptTokens : estimatePromptTokens(request);
-      long completion = completionTokens >= 0 ? completionTokens : 0;
+      long completion = completionTokens >= 0 ? completionTokens : estimateCompletionTokens();
       long total = totalTokens >= 0 ? totalTokens : prompt + completion;
       boolean fromProvider = promptTokens >= 0 || completionTokens >= 0 || totalTokens >= 0;
       return new UsageSnapshot(prompt, completion, total, fromProvider);
@@ -62,16 +63,21 @@ public class UsageMeteringService {
       if (text == null || text.isBlank()) {
         return;
       }
-      String trimmed = text.trim();
-      if (trimmed.startsWith("data:")) {
-        String payload = trimmed.substring("data:".length()).trim();
-        if (!payload.isEmpty() && !payload.equals("[DONE]")) {
-          captureUsageFromJsonText(payload);
+      for (String line : text.split("\\R")) {
+        String trimmed = line.trim();
+        if (trimmed.isEmpty() || trimmed.startsWith("event:")) {
+          continue;
         }
-        return;
-      }
-      if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-        captureUsageFromJsonText(trimmed);
+        if (trimmed.startsWith("data:")) {
+          String payload = trimmed.substring("data:".length()).trim();
+          if (!payload.isEmpty() && !payload.equals("[DONE]")) {
+            captureUsageFromJsonText(payload);
+          }
+          continue;
+        }
+        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+          captureUsageFromJsonText(trimmed);
+        }
       }
     }
 
@@ -113,6 +119,8 @@ public class UsageMeteringService {
           mergeOpenAiUsage(choiceUsage);
         }
       }
+
+      captureCompletionText(root);
     }
 
     private void mergeOpenAiUsage(JsonNode usage) {
@@ -144,12 +152,64 @@ public class UsageMeteringService {
       }
     }
 
+    private void captureCompletionText(JsonNode root) {
+      appendContentNode(root.path("output_text"));
+      appendContentNode(root.path("content"));
+      appendContentNode(root.path("delta"));
+
+      JsonNode message = root.path("message");
+      if (!message.isMissingNode() && !message.isNull()) {
+        appendContentNode(message.path("content"));
+      }
+
+      JsonNode choices = root.path("choices");
+      if (choices instanceof ArrayNode choiceArray) {
+        for (JsonNode choice : choiceArray) {
+          appendContentNode(choice.path("text"));
+          appendContentNode(choice.path("delta"));
+          JsonNode choiceMessage = choice.path("message");
+          if (!choiceMessage.isMissingNode() && !choiceMessage.isNull()) {
+            appendContentNode(choiceMessage.path("content"));
+          }
+        }
+      }
+    }
+
+    private void appendContentNode(JsonNode node) {
+      if (node == null || node.isMissingNode() || node.isNull()) {
+        return;
+      }
+      if (node.isTextual()) {
+        appendText(node.asText());
+        return;
+      }
+      if (node.isArray()) {
+        for (JsonNode child : node) {
+          appendContentNode(child);
+        }
+        return;
+      }
+      appendText(node.path("text").asText(null));
+      appendText(node.path("content").asText(null));
+    }
+
+    private void appendText(String text) {
+      if (text == null || text.isBlank()) {
+        return;
+      }
+      completionText.append(text);
+    }
+
     private long estimatePromptTokens(JsonNode request) {
       JsonNode messages = request.path("messages");
       if (messages.isMissingNode() || !messages.isArray()) {
         return 1;
       }
       return Math.max(1, messages.toString().length() / 4L);
+    }
+
+    private long estimateCompletionTokens() {
+      return Math.max(0, completionText.length() / 4L);
     }
   }
 }
