@@ -1,6 +1,7 @@
 package com.tokenrelay.gateway.admin;
 
 import com.tokenrelay.gateway.config.AdminSecurityWebFilter;
+import com.tokenrelay.gateway.domain.ApiKeyModelScope;
 import com.tokenrelay.gateway.domain.ApiKeyRecord;
 import com.tokenrelay.gateway.domain.AuditLog;
 import com.tokenrelay.gateway.domain.GatewayUser;
@@ -8,10 +9,12 @@ import com.tokenrelay.gateway.domain.ProviderKey;
 import com.tokenrelay.gateway.domain.WorkspaceMembership;
 import com.tokenrelay.gateway.repository.WorkspaceMembershipRepository;
 import com.tokenrelay.gateway.repository.WorkspaceRepository;
+import com.tokenrelay.gateway.repository.ApiKeyModelScopeRepository;
 import com.tokenrelay.gateway.repository.ApiKeyRepository;
 import com.tokenrelay.gateway.repository.AuditLogRepository;
 import com.tokenrelay.gateway.repository.GatewayUserRepository;
 import com.tokenrelay.gateway.repository.ProviderKeyRepository;
+import com.tokenrelay.gateway.service.ApiKeyPolicyService;
 import com.tokenrelay.gateway.service.AuditService;
 import com.tokenrelay.gateway.service.GatewayException;
 import com.tokenrelay.gateway.service.HashService;
@@ -58,11 +61,13 @@ import reactor.core.publisher.Mono;
 public class AdminController {
   private final GatewayUserRepository users;
   private final ApiKeyRepository apiKeys;
+  private final ApiKeyModelScopeRepository apiKeyModelScopes;
   private final ProviderKeyRepository providerKeys;
   private final WorkspaceRepository workspaces;
   private final WorkspaceMembershipRepository memberships;
   private final AuditLogRepository auditLogs;
   private final HashService hashService;
+  private final ApiKeyPolicyService apiKeyPolicyService;
   private final PasswordHashService passwordHashService;
   private final ProviderKeySecurityService providerKeySecurity;
   private final ProviderHealthCheckService providerHealthCheckService;
@@ -74,11 +79,13 @@ public class AdminController {
   public AdminController(
       GatewayUserRepository users,
       ApiKeyRepository apiKeys,
+      ApiKeyModelScopeRepository apiKeyModelScopes,
       ProviderKeyRepository providerKeys,
       WorkspaceRepository workspaces,
       WorkspaceMembershipRepository memberships,
       AuditLogRepository auditLogs,
       HashService hashService,
+      ApiKeyPolicyService apiKeyPolicyService,
       PasswordHashService passwordHashService,
       ProviderKeySecurityService providerKeySecurity,
       ProviderHealthCheckService providerHealthCheckService,
@@ -87,11 +94,13 @@ public class AdminController {
       R2dbcEntityTemplate template) {
     this.users = users;
     this.apiKeys = apiKeys;
+    this.apiKeyModelScopes = apiKeyModelScopes;
     this.providerKeys = providerKeys;
     this.workspaces = workspaces;
     this.memberships = memberships;
     this.auditLogs = auditLogs;
     this.hashService = hashService;
+    this.apiKeyPolicyService = apiKeyPolicyService;
     this.passwordHashService = passwordHashService;
     this.providerKeySecurity = providerKeySecurity;
     this.providerHealthCheckService = providerHealthCheckService;
@@ -138,8 +147,40 @@ public class AdminController {
   }
 
   @GetMapping("/admin/api-keys")
-  public Flux<ApiKeyRecord> apiKeys(ServerWebExchange exchange) {
-    return apiKeys.findAll();
+  public Flux<ApiKeyView> apiKeys(ServerWebExchange exchange) {
+    Mono<Map<UUID, ApiKeyStats>> statsByKey = databaseClient.sql("""
+        SELECT
+          ue.api_key_id AS api_key_id,
+          count(*) AS request_count,
+          coalesce(sum(ue.total_tokens), 0) AS total_tokens,
+          max(ue.created_at) AS last_request_at
+        FROM usage_events ue
+        GROUP BY ue.api_key_id
+        """)
+        .fetch()
+        .all()
+        .collectMap(
+            row -> (UUID) row.get("api_key_id"),
+            row -> new ApiKeyStats(
+                (UUID) row.get("api_key_id"),
+                longValue(row.get("request_count")),
+                longValue(row.get("total_tokens")),
+                toInstant(row.get("last_request_at"))));
+
+    Mono<Map<UUID, List<String>>> scopesByKey = apiKeyModelScopes.findByStatus("ACTIVE")
+        .collectMultimap(ApiKeyModelScope::apiKeyId, ApiKeyModelScope::modelPattern)
+        .map(multimap -> {
+          java.util.Map<UUID, List<String>> grouped = new java.util.HashMap<>();
+          multimap.forEach((key, values) -> grouped.put(key, values.stream().toList()));
+          return grouped;
+        });
+
+    return Mono.zip(statsByKey, scopesByKey)
+        .flatMapMany(tuple -> apiKeys.findAll()
+            .map(apiKey -> toApiKeyView(
+                apiKey,
+                tuple.getT1().get(apiKey.id()),
+                tuple.getT2().getOrDefault(apiKey.id(), List.of()))));
   }
 
   @PostMapping("/admin/api-keys")
@@ -158,13 +199,115 @@ public class AdminController {
               rawKey.substring(0, 10),
               hashService.sha256(rawKey),
               "ACTIVE",
-              request.rateLimitPerMinute(),
+              normalizeRateLimit(request.rateLimitPerMinute()),
+              normalizeMonthlyTokenQuota(request.monthlyTokenQuota()),
               null,
               null);
           return apiKeys.save(key)
-              .flatMap(saved -> auditService.log(actor, "CREATE_API_KEY", saved.id().toString(), saved.keyPrefix()).thenReturn(saved))
-              .map(saved -> ResponseEntity.ok(new CreateApiKeyResponse(saved, rawKey)));
+              .flatMap(saved -> apiKeyPolicyService.replaceScopes(saved.id(), request.modelScopes())
+                  .then(auditService.log(actor, "CREATE_API_KEY", saved.id().toString(), saved.keyPrefix()))
+                  .thenReturn(saved))
+              .map(saved -> ResponseEntity.ok(new CreateApiKeyResponse(rawKey)));
         });
+  }
+
+  @PostMapping("/admin/api-keys/{apiKeyId}")
+  public Mono<ApiKeyView> updateApiKey(
+      ServerWebExchange exchange,
+      @PathVariable UUID apiKeyId,
+      @Valid @RequestBody UpdateApiKeyRequest request) {
+    String actor = currentAdmin(exchange).username();
+    return apiKeys.findById(apiKeyId)
+        .switchIfEmpty(Mono.error(new GatewayException(404, "api_key_not_found", "API key not found")))
+        .flatMap(existing -> {
+          ApiKeyRecord updated = new ApiKeyRecord(
+              existing.id(),
+              existing.userId(),
+              existing.workspaceId(),
+              request.name() == null || request.name().isBlank() ? existing.name() : request.name().trim(),
+              existing.keyPrefix(),
+              existing.keyHash(),
+              request.status() == null || request.status().isBlank()
+                  ? existing.status()
+                  : normalizeApiKeyStatus(request.status()),
+              request.rateLimitPerMinute() == null ? existing.rateLimitPerMinute() : normalizeRateLimit(request.rateLimitPerMinute()),
+              request.monthlyTokenQuota() == null ? existing.monthlyTokenQuota() : normalizeMonthlyTokenQuota(request.monthlyTokenQuota()),
+              existing.createdAt(),
+              existing.lastUsedAt());
+          return apiKeys.save(updated)
+              .flatMap(saved -> {
+                Mono<Void> scopesUpdate = request.modelScopes() == null
+                    ? Mono.empty()
+                    : apiKeyPolicyService.replaceScopes(saved.id(), request.modelScopes());
+                return scopesUpdate
+                    .then(auditService.log(actor, "UPDATE_API_KEY", saved.id().toString(), saved.status()))
+                    .then(loadApiKeyView(saved));
+              });
+        });
+  }
+
+  @PostMapping("/admin/api-keys/{apiKeyId}/delete")
+  public Mono<ApiKeyView> deleteApiKey(
+      ServerWebExchange exchange,
+      @PathVariable UUID apiKeyId) {
+    String actor = currentAdmin(exchange).username();
+    return apiKeys.findById(apiKeyId)
+        .switchIfEmpty(Mono.error(new GatewayException(404, "api_key_not_found", "API key not found")))
+        .flatMap(existing -> apiKeys.save(new ApiKeyRecord(
+                existing.id(),
+                existing.userId(),
+                existing.workspaceId(),
+                existing.name(),
+                existing.keyPrefix(),
+                existing.keyHash(),
+                "DELETED",
+                existing.rateLimitPerMinute(),
+                existing.monthlyTokenQuota(),
+                existing.createdAt(),
+                existing.lastUsedAt()))
+            .flatMap(saved -> auditService.log(actor, "DELETE_API_KEY", saved.id().toString(), saved.keyPrefix())
+                .then(loadApiKeyView(saved))));
+  }
+
+  @GetMapping("/admin/api-keys/{apiKeyId}/usage-logs")
+  public Flux<ApiKeyUsageLogView> apiKeyUsageLogs(
+      ServerWebExchange exchange,
+      @PathVariable UUID apiKeyId,
+      @RequestParam(defaultValue = "20") int limit) {
+    int normalizedLimit = Math.max(1, Math.min(limit, 200));
+    return apiKeys.findById(apiKeyId)
+        .switchIfEmpty(Mono.error(new GatewayException(404, "api_key_not_found", "API key not found")))
+        .thenMany(databaseClient.sql("""
+            SELECT
+              ue.id::text AS usage_event_id,
+              ue.provider AS provider,
+              ue.model AS model,
+              ue.status_code AS status_code,
+              ue.prompt_tokens AS prompt_tokens,
+              ue.completion_tokens AS completion_tokens,
+              ue.total_tokens AS total_tokens,
+              ue.estimated_cost_usd AS estimated_cost_usd,
+              ue.request_id AS request_id,
+              ue.created_at AS created_at
+            FROM usage_events ue
+            WHERE ue.api_key_id = :api_key_id
+            ORDER BY ue.created_at DESC
+            LIMIT :limit
+            """)
+            .bind("api_key_id", apiKeyId)
+            .bind("limit", normalizedLimit)
+            .map((row, metadata) -> new ApiKeyUsageLogView(
+                (String) row.get("usage_event_id"),
+                (String) row.get("provider"),
+                (String) row.get("model"),
+                ((Number) row.get("status_code")).intValue(),
+                longValue(row.get("prompt_tokens")),
+                longValue(row.get("completion_tokens")),
+                longValue(row.get("total_tokens")),
+                decimalString(row.get("estimated_cost_usd")),
+                (String) row.get("request_id"),
+                toInstant(row.get("created_at"))))
+            .all());
   }
 
   @GetMapping("/admin/provider-keys")
@@ -504,6 +647,22 @@ public class AdminController {
     return new java.math.BigDecimal(value.toString());
   }
 
+  private Instant toInstant(Object value) {
+    if (value == null) {
+      return null;
+    }
+    if (value instanceof Instant instant) {
+      return instant;
+    }
+    if (value instanceof java.time.OffsetDateTime offsetDateTime) {
+      return offsetDateTime.toInstant();
+    }
+    if (value instanceof java.time.LocalDateTime localDateTime) {
+      return localDateTime.toInstant(ZoneOffset.UTC);
+    }
+    return Instant.parse(value.toString());
+  }
+
   private String csvCell(String value) {
     if (value == null) {
       return "";
@@ -554,6 +713,28 @@ public class AdminController {
       case "ACTIVE", "DISABLED" -> normalized;
       default -> throw new GatewayException(400, "invalid_provider_status", "status must be ACTIVE or DISABLED");
     };
+  }
+
+  private String normalizeApiKeyStatus(String status) {
+    if (status == null || status.isBlank()) {
+      return "ACTIVE";
+    }
+    String normalized = status.trim().toUpperCase(Locale.ROOT);
+    return switch (normalized) {
+      case "ACTIVE", "DISABLED", "DELETED" -> normalized;
+      default -> throw new GatewayException(400, "invalid_api_key_status", "status must be ACTIVE, DISABLED, or DELETED");
+    };
+  }
+
+  private int normalizeRateLimit(int rateLimitPerMinute) {
+    return rateLimitPerMinute <= 0 ? 60 : rateLimitPerMinute;
+  }
+
+  private Long normalizeMonthlyTokenQuota(Long monthlyTokenQuota) {
+    if (monthlyTokenQuota == null || monthlyTokenQuota <= 0) {
+      return null;
+    }
+    return monthlyTokenQuota;
   }
 
   private String blankToNull(String value) {
@@ -661,6 +842,58 @@ public class AdminController {
     return email.trim().toLowerCase(Locale.ROOT);
   }
 
+  private Mono<ApiKeyView> loadApiKeyView(ApiKeyRecord apiKey) {
+    Mono<ApiKeyStats> statsMono = databaseClient.sql("""
+        SELECT
+          count(*) AS request_count,
+          coalesce(sum(total_tokens), 0) AS total_tokens,
+          max(created_at) AS last_request_at
+        FROM usage_events
+        WHERE api_key_id = :api_key_id
+        """)
+        .bind("api_key_id", apiKey.id())
+        .fetch()
+        .one()
+        .map(row -> new ApiKeyStats(
+            apiKey.id(),
+            longValue(row.get("request_count")),
+            longValue(row.get("total_tokens")),
+            toInstant(row.get("last_request_at"))))
+        .defaultIfEmpty(new ApiKeyStats(apiKey.id(), 0L, 0L, null));
+
+    Mono<List<String>> scopesMono = apiKeyModelScopes.findByApiKeyIdAndStatus(apiKey.id(), "ACTIVE")
+        .map(ApiKeyModelScope::modelPattern)
+        .collectList();
+
+    return Mono.zip(statsMono, scopesMono)
+        .map(tuple -> toApiKeyView(apiKey, tuple.getT1(), tuple.getT2()));
+  }
+
+  private ApiKeyView toApiKeyView(ApiKeyRecord apiKey, ApiKeyStats stats, List<String> modelScopes) {
+    String allowedModels = modelScopes == null || modelScopes.isEmpty()
+        ? "*"
+        : String.join(", ", modelScopes);
+    return new ApiKeyView(
+        apiKey.id(),
+        apiKey.userId(),
+        apiKey.workspaceId(),
+        apiKey.name(),
+        apiKey.keyPrefix(),
+        apiKey.status(),
+        apiKey.rateLimitPerMinute(),
+        apiKey.monthlyTokenQuota(),
+        apiKey.createdAt(),
+        apiKey.lastUsedAt(),
+        stats == null ? 0L : stats.requestCount(),
+        stats == null ? 0L : stats.totalTokens(),
+        stats == null ? apiKey.lastUsedAt() : (stats.lastRequestAt() == null ? apiKey.lastUsedAt() : stats.lastRequestAt()),
+        allowedModels);
+  }
+
+  private String decimalString(Object value) {
+    return decimalValue(value).toPlainString();
+  }
+
   public record CreateUserRequest(
       @Email String email,
       @NotBlank String displayName,
@@ -685,9 +918,48 @@ public class AdminController {
       UUID userId,
       UUID workspaceId,
       @NotBlank String name,
-      int rateLimitPerMinute) {}
+      int rateLimitPerMinute,
+      Long monthlyTokenQuota,
+      List<String> modelScopes) {}
 
-  public record CreateApiKeyResponse(ApiKeyRecord apiKey, String rawKey) {}
+  public record UpdateApiKeyRequest(
+      String name,
+      Integer rateLimitPerMinute,
+      Long monthlyTokenQuota,
+      String status,
+      List<String> modelScopes) {}
+
+  public record CreateApiKeyResponse(String rawKey) {}
+
+  public record ApiKeyView(
+      UUID id,
+      UUID userId,
+      UUID workspaceId,
+      String name,
+      String keyPrefix,
+      String status,
+      int rateLimitPerMinute,
+      Long monthlyTokenQuota,
+      Instant createdAt,
+      Instant lastUsedAt,
+      long requestCount,
+      long totalTokens,
+      Instant lastRequestAt,
+      String allowedModels) {}
+
+  public record ApiKeyUsageLogView(
+      String usageEventId,
+      String provider,
+      String model,
+      int statusCode,
+      long promptTokens,
+      long completionTokens,
+      long totalTokens,
+      String estimatedCostUsd,
+      String requestId,
+      Instant createdAt) {}
+
+  private record ApiKeyStats(UUID apiKeyId, long requestCount, long totalTokens, Instant lastRequestAt) {}
 
   public record CreateProviderKeyRequest(
       @NotBlank String provider,

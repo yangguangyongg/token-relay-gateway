@@ -4,7 +4,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tokenrelay.gateway.auth.AuthContext;
 import com.tokenrelay.gateway.domain.UsageEvent;
+import com.tokenrelay.gateway.repository.ApiKeyRepository;
 import com.tokenrelay.gateway.repository.UsageEventRepository;
+import com.tokenrelay.gateway.service.ApiKeyPolicyService;
 import com.tokenrelay.gateway.service.AuthService;
 import com.tokenrelay.gateway.service.BillingControlService;
 import com.tokenrelay.gateway.service.ComplianceService;
@@ -16,6 +18,7 @@ import com.tokenrelay.gateway.service.UsageMeteringService;
 import com.tokenrelay.gateway.service.WorkspaceModelPolicyService;
 import java.util.UUID;
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.List;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -31,7 +34,9 @@ import reactor.core.publisher.Mono;
 @RestController
 public class ProxyController {
   private final AuthService authService;
+  private final ApiKeyRepository apiKeys;
   private final ComplianceService complianceService;
+  private final ApiKeyPolicyService apiKeyPolicyService;
   private final RateLimitService rateLimitService;
   private final QuotaService quotaService;
   private final ProviderRouter router;
@@ -44,7 +49,9 @@ public class ProxyController {
 
   public ProxyController(
       AuthService authService,
+      ApiKeyRepository apiKeys,
       ComplianceService complianceService,
+      ApiKeyPolicyService apiKeyPolicyService,
       RateLimitService rateLimitService,
       QuotaService quotaService,
       ProviderRouter router,
@@ -55,7 +62,9 @@ public class ProxyController {
       WorkspaceModelPolicyService workspaceModelPolicyService,
       ObjectMapper objectMapper) {
     this.authService = authService;
+    this.apiKeys = apiKeys;
     this.complianceService = complianceService;
+    this.apiKeyPolicyService = apiKeyPolicyService;
     this.rateLimitService = rateLimitService;
     this.quotaService = quotaService;
     this.router = router;
@@ -72,6 +81,7 @@ public class ProxyController {
     String requestId = UUID.randomUUID().toString();
     return authService.authenticate(exchange)
         .flatMap(context -> complianceService.check(exchange).thenReturn(context))
+        .flatMap(context -> apiKeyPolicyService.validate(context.apiKey(), request).thenReturn(context))
         .flatMap(context -> workspaceModelPolicyService.validate(context.workspace().id(), request).thenReturn(context))
         .flatMap(context -> rateLimitService.check(context.apiKey()).thenReturn(context))
         .flatMap(context -> quotaService.reserve(context).thenReturn(context))
@@ -147,6 +157,19 @@ public class ProxyController {
               requestId,
               null);
           return usageEvents.save(event)
+              .flatMap(saved -> apiKeys.save(new com.tokenrelay.gateway.domain.ApiKeyRecord(
+                      context.apiKey().id(),
+                      context.apiKey().userId(),
+                      context.apiKey().workspaceId(),
+                      context.apiKey().name(),
+                      context.apiKey().keyPrefix(),
+                      context.apiKey().keyHash(),
+                      context.apiKey().status(),
+                      context.apiKey().rateLimitPerMinute(),
+                      context.apiKey().monthlyTokenQuota(),
+                      context.apiKey().createdAt(),
+                      Instant.now()))
+                  .thenReturn(saved))
               .flatMap(saved -> billingControlService.evaluate(saved.userId(), estimatedCost, requestId))
               .then();
         });

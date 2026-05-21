@@ -19,6 +19,25 @@ type ApiKey = {
   keyPrefix: string;
   status: string;
   rateLimitPerMinute: number;
+  monthlyTokenQuota: number | null;
+  lastUsedAt: string | null;
+  requestCount: number;
+  totalTokens: number;
+  lastRequestAt: string | null;
+  allowedModels: string;
+};
+
+type ApiKeyUsageLog = {
+  usageEventId: string;
+  provider: string;
+  model: string;
+  statusCode: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  estimatedCostUsd: string;
+  requestId: string;
+  createdAt: string;
 };
 
 type ProviderKey = {
@@ -183,6 +202,7 @@ const billsPath = (month: string) => `/api/admin/bills?month=${encodeURIComponen
 const workspacesPath = () => '/api/admin/workspaces';
 const workspaceMembersPath = (workspaceId: string) => `/api/admin/workspaces/${encodeURIComponent(workspaceId)}/members`;
 const workspaceModelConfigsPath = (workspaceId: string) => `/api/admin/workspaces/${encodeURIComponent(workspaceId)}/model-configs`;
+const apiKeyUsageLogsPath = (apiKeyId: string) => `/api/admin/api-keys/${encodeURIComponent(apiKeyId)}/usage-logs`;
 
 const parseDownloadFileName = (contentDisposition: string | null, fallback: string) => {
   if (!contentDisposition) {
@@ -257,6 +277,12 @@ const api = async <T,>(path: string, adminToken?: string, options: RequestInit =
   return response.json();
 };
 
+const parseModelScopes = (value: string) =>
+  value
+    .split(/[\n,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
 function App() {
   const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
@@ -266,6 +292,15 @@ function App() {
   const [adminSessionExpiresAt, setAdminSessionExpiresAt] = useState<number | null>(null);
   const [users, setUsers] = useState<User[]>([]);
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
+  const [selectedApiKeyId, setSelectedApiKeyId] = useState('');
+  const [apiKeyUsageLogs, setApiKeyUsageLogs] = useState<ApiKeyUsageLog[]>([]);
+  const [apiKeyEditor, setApiKeyEditor] = useState({
+    name: '',
+    status: 'ACTIVE',
+    rateLimitPerMinute: '60',
+    monthlyTokenQuota: '',
+    modelScopesText: ''
+  });
   const [providerKeys, setProviderKeys] = useState<ProviderKey[]>([]);
   const [usage, setUsage] = useState<UsageRow[]>([]);
   const [usageDetails, setUsageDetails] = useState<UsageDetailRow[]>([]);
@@ -306,6 +341,15 @@ function App() {
     setAdminSessionExpiresAt(null);
     setUsers([]);
     setApiKeys([]);
+    setSelectedApiKeyId('');
+    setApiKeyUsageLogs([]);
+    setApiKeyEditor({
+      name: '',
+      status: 'ACTIVE',
+      rateLimitPerMinute: '60',
+      monthlyTokenQuota: '',
+      modelScopesText: ''
+    });
     setProviderKeys([]);
     setUsage([]);
     setUsageDetails([]);
@@ -354,6 +398,10 @@ function App() {
       ]);
       setUsers(loadedUsers);
       setApiKeys(loadedApiKeys);
+      const nextApiKeyId = selectedApiKeyId && loadedApiKeys.some((item) => item.id === selectedApiKeyId)
+        ? selectedApiKeyId
+        : (loadedApiKeys[0]?.id ?? '');
+      setSelectedApiKeyId(nextApiKeyId);
       setProviderKeys(loadedProviders);
       setUsage(loadedUsage);
       setUsageDetails(loadedUsageDetails);
@@ -400,6 +448,16 @@ function App() {
     setWorkspaceModelConfigs(modelConfigData);
   };
 
+  const loadApiKeyUsageLogs = async (apiKeyId: string, tokenOverride?: string) => {
+    const token = tokenOverride ?? adminToken;
+    if (!token || !apiKeyId) {
+      setApiKeyUsageLogs([]);
+      return;
+    }
+    const logs = await api<ApiKeyUsageLog[]>(apiKeyUsageLogsPath(apiKeyId), token);
+    setApiKeyUsageLogs(logs);
+  };
+
   useEffect(() => {
     const stored = loadStoredAdminSession();
     if (!stored) {
@@ -432,6 +490,33 @@ function App() {
     }, remainingMs);
     return () => window.clearTimeout(timeoutId);
   }, [adminToken, adminSessionExpiresAt]);
+
+  useEffect(() => {
+    if (!selectedApiKeyId) {
+      setApiKeyEditor({
+        name: '',
+        status: 'ACTIVE',
+        rateLimitPerMinute: '60',
+        monthlyTokenQuota: '',
+        modelScopesText: ''
+      });
+      setApiKeyUsageLogs([]);
+      return;
+    }
+    const selectedKey = apiKeys.find((item) => item.id === selectedApiKeyId);
+    if (!selectedKey) {
+      setApiKeyUsageLogs([]);
+      return;
+    }
+    setApiKeyEditor({
+      name: selectedKey.name,
+      status: selectedKey.status,
+      rateLimitPerMinute: String(selectedKey.rateLimitPerMinute),
+      monthlyTokenQuota: selectedKey.monthlyTokenQuota == null ? '' : String(selectedKey.monthlyTokenQuota),
+      modelScopesText: selectedKey.allowedModels === '*' ? '' : selectedKey.allowedModels
+    });
+    void loadApiKeyUsageLogs(selectedApiKeyId);
+  }, [selectedApiKeyId, apiKeys]);
 
   const login = async () => {
     setMessage('Signing in...');
@@ -523,11 +608,46 @@ function App() {
         userId: form.get('userId'),
         workspaceId: workspaceId || null,
         name: form.get('name'),
-        rateLimitPerMinute: Number(form.get('rateLimitPerMinute'))
+        rateLimitPerMinute: Number(form.get('rateLimitPerMinute')),
+        monthlyTokenQuota: (() => {
+          const raw = (form.get('monthlyTokenQuota') || '').toString().trim();
+          return raw ? Number(raw) : null;
+        })(),
+        modelScopes: parseModelScopes((form.get('modelScopesText') || '').toString())
       })
     });
     setRawKey(response.rawKey);
     event.currentTarget.reset();
+    await load();
+  };
+
+  const updateApiKeySettings = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedApiKeyId) {
+      setMessage('Select an API key first');
+      return;
+    }
+    await api(`/api/admin/api-keys/${encodeURIComponent(selectedApiKeyId)}`, adminToken, {
+      method: 'POST',
+      body: JSON.stringify({
+        name: apiKeyEditor.name,
+        status: apiKeyEditor.status,
+        rateLimitPerMinute: Number(apiKeyEditor.rateLimitPerMinute),
+        monthlyTokenQuota: apiKeyEditor.monthlyTokenQuota.trim() ? Number(apiKeyEditor.monthlyTokenQuota) : null,
+        modelScopes: parseModelScopes(apiKeyEditor.modelScopesText)
+      })
+    });
+    await load();
+  };
+
+  const deleteApiKey = async () => {
+    if (!selectedApiKeyId) {
+      setMessage('Select an API key first');
+      return;
+    }
+    await api(`/api/admin/api-keys/${encodeURIComponent(selectedApiKeyId)}/delete`, adminToken, {
+      method: 'POST'
+    });
     await load();
   };
 
@@ -896,7 +1016,7 @@ function App() {
             </Panel>
 
             <Panel title="Gateway API Keys" icon={<KeyRound />}>
-              <p className="panel-note">Gateway API keys belong to a specific workspace. Pick the workspace explicitly when a user participates in more than one team.</p>
+              <p className="panel-note">Create separate keys per project, give each key its own token budget, and restrict high-risk keys to a smaller model allowlist when needed.</p>
               <form onSubmit={createApiKey} className="form">
                 <select name="userId" required>
                   <option value="">Select user</option>
@@ -912,9 +1032,67 @@ function App() {
                 </select>
                 <input name="name" placeholder="Key name" required />
                 <input name="rateLimitPerMinute" type="number" defaultValue="60" min="1" required />
+                <input name="monthlyTokenQuota" type="number" min="1" placeholder="Monthly token quota (optional)" />
+                <input name="modelScopesText" placeholder="Allowed models, comma separated (optional)" />
                 <button><Plus size={16} /> Create key</button>
               </form>
-              <Table rows={apiKeys} columns={['name', 'workspaceId', 'keyPrefix', 'status', 'rateLimitPerMinute']} />
+              <form onSubmit={updateApiKeySettings} className="form">
+                <select
+                  value={selectedApiKeyId}
+                  onChange={(event) => setSelectedApiKeyId(event.target.value)}
+                  required
+                >
+                  <option value="">Select API key</option>
+                  {apiKeys.map((apiKey) => (
+                    <option key={apiKey.id} value={apiKey.id}>
+                      {apiKey.name} / {apiKey.keyPrefix} / {apiKey.status}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  value={apiKeyEditor.name}
+                  onChange={(event) => setApiKeyEditor((current) => ({ ...current, name: event.target.value }))}
+                  placeholder="Key name"
+                />
+                <select
+                  value={apiKeyEditor.status}
+                  onChange={(event) => setApiKeyEditor((current) => ({ ...current, status: event.target.value }))}
+                >
+                  <option value="ACTIVE">ACTIVE</option>
+                  <option value="DISABLED">DISABLED</option>
+                </select>
+                <input
+                  value={apiKeyEditor.rateLimitPerMinute}
+                  onChange={(event) => setApiKeyEditor((current) => ({ ...current, rateLimitPerMinute: event.target.value }))}
+                  type="number"
+                  min="1"
+                  placeholder="Rate limit / minute"
+                />
+                <input
+                  value={apiKeyEditor.monthlyTokenQuota}
+                  onChange={(event) => setApiKeyEditor((current) => ({ ...current, monthlyTokenQuota: event.target.value }))}
+                  type="number"
+                  min="1"
+                  placeholder="Monthly token quota"
+                />
+                <input
+                  value={apiKeyEditor.modelScopesText}
+                  onChange={(event) => setApiKeyEditor((current) => ({ ...current, modelScopesText: event.target.value }))}
+                  placeholder="Allowed models, comma separated"
+                />
+                <button type="submit">
+                  <RefreshCw size={16} />
+                  Update key
+                </button>
+                <button type="button" onClick={deleteApiKey}>
+                  Delete key
+                </button>
+              </form>
+              <Table rows={apiKeys} columns={['name', 'workspaceId', 'keyPrefix', 'status', 'rateLimitPerMinute', 'monthlyTokenQuota', 'requestCount', 'totalTokens', 'lastRequestAt', 'allowedModels']} />
+              <div className="subsection">
+                <h3>Selected Key Usage Logs</h3>
+                <Table rows={apiKeyUsageLogs} columns={['createdAt', 'provider', 'model', 'statusCode', 'promptTokens', 'completionTokens', 'totalTokens', 'estimatedCostUsd', 'requestId']} />
+              </div>
             </Panel>
 
             <Panel title="Usage Summary" icon={<BarChart3 />}>

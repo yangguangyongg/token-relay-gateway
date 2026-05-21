@@ -168,6 +168,7 @@ public class BillingControlService {
         key.keyHash(),
         status,
         key.rateLimitPerMinute(),
+        key.monthlyTokenQuota(),
         key.createdAt(),
         key.lastUsedAt());
   }

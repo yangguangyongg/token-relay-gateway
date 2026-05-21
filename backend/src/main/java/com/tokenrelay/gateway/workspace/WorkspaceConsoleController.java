@@ -195,6 +195,7 @@ public class WorkspaceConsoleController {
               hashService.sha256(rawKey),
               "ACTIVE",
               request.rateLimitPerMinute() <= 0 ? 60 : request.rateLimitPerMinute(),
+              request.monthlyTokenQuota() == null || request.monthlyTokenQuota() <= 0 ? null : request.monthlyTokenQuota(),
               null,
               null);
           return apiKeys.save(key)
@@ -369,7 +370,8 @@ public class WorkspaceConsoleController {
 
   public record CreateApiKeyRequest(
       @NotBlank String name,
-      int rateLimitPerMinute) {}
+      int rateLimitPerMinute,
+      Long monthlyTokenQuota) {}
 
   public record CreateApiKeyResponse(ApiKeyRecord apiKey, String rawKey) {}
 

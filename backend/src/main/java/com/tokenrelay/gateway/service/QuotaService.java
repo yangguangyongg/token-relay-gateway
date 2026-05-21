@@ -18,14 +18,42 @@ public class QuotaService {
   }
 
   public Mono<Void> reserve(AuthContext context) {
-    String key = "quota:" + context.user().id() + ":" + YearMonth.now(ZoneOffset.UTC);
+    String monthKey = YearMonth.now(ZoneOffset.UTC).toString();
+    String apiKeyQuotaKey = "quota:key:" + context.apiKey().id() + ":" + monthKey;
+    String userQuotaKey = "quota:user:" + context.user().id() + ":" + monthKey;
+
+    Mono<Void> reserveApiKeyQuota = reserveCounter(
+        apiKeyQuotaKey,
+        context.apiKey().monthlyTokenQuota(),
+        "api_key_quota_exceeded",
+        "API key monthly token quota exceeded");
+
+    Mono<Void> reserveUserQuota = reserveCounter(
+        userQuotaKey,
+        context.user().monthlyTokenQuota(),
+        "quota_exceeded",
+        "Monthly token quota exceeded");
+
+    return reserveApiKeyQuota
+        .then(reserveUserQuota.onErrorResume(error -> rollback(apiKeyQuotaKey).then(Mono.error(error))));
+  }
+
+  private Mono<Void> reserveCounter(String key, Long limit, String errorCode, String message) {
+    if (limit == null || limit <= 0) {
+      return Mono.empty();
+    }
     return redis.opsForValue().increment(key, DEFAULT_RESERVATION_TOKENS)
         .flatMap(total -> redis.expire(key, Duration.ofDays(45)).thenReturn(total))
         .flatMap(total -> {
-          if (total > context.user().monthlyTokenQuota()) {
-            return Mono.error(new GatewayException(402, "quota_exceeded", "Monthly token quota exceeded"));
+          if (total > limit) {
+            return rollback(key)
+                .then(Mono.error(new GatewayException(402, errorCode, message)));
           }
           return Mono.empty();
         });
+  }
+
+  private Mono<Void> rollback(String key) {
+    return redis.opsForValue().increment(key, -DEFAULT_RESERVATION_TOKENS).then();
   }
 }

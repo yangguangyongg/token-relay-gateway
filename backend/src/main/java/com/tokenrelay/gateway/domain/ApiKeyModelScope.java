@@ -5,16 +5,11 @@ import java.util.UUID;
 import org.springframework.data.annotation.Id;
 import org.springframework.data.relational.core.mapping.Table;
 
-@Table("api_keys")
-public record ApiKeyRecord(
+@Table("api_key_model_scopes")
+public record ApiKeyModelScope(
     @Id UUID id,
-    UUID userId,
-    UUID workspaceId,
-    String name,
-    String keyPrefix,
-    String keyHash,
+    UUID apiKeyId,
+    String modelPattern,
     String status,
-    int rateLimitPerMinute,
-    Long monthlyTokenQuota,
     Instant createdAt,
-    Instant lastUsedAt) {}
+    Instant updatedAt) {}

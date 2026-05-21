@@ -205,6 +205,18 @@ button:active {
   font-size: 14px;
 }
 
+.subsection {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.subsection h3 {
+  margin: 0;
+  font-size: 15px;
+  color: #334155;
+}
+
 .form {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
