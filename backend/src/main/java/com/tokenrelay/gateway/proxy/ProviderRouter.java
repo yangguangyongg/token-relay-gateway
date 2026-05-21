@@ -1,6 +1,5 @@
 package com.tokenrelay.gateway.proxy;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.tokenrelay.gateway.adapter.ProviderAdapter;
 import com.tokenrelay.gateway.auth.AuthContext;
 import com.tokenrelay.gateway.domain.ProviderKey;
@@ -27,7 +26,7 @@ public class ProviderRouter {
     this.providerKeySecurity = providerKeySecurity;
   }
 
-  public Mono<List<RouteCandidate>> candidates(AuthContext context, JsonNode request) {
+  public Mono<List<RouteCandidate>> candidates(AuthContext context, GatewayRequest request) {
     return providerKeys.findByOwnerUserIdAndStatusOrderByPriorityAsc(context.user().id(), "ACTIVE")
         .collectList()
         .flatMap(userOwnedKeys -> {
@@ -44,7 +43,7 @@ public class ProviderRouter {
         });
   }
 
-  private Mono<ProviderAdapter> adapterFor(ProviderKey key, JsonNode request) {
+  private Mono<ProviderAdapter> adapterFor(ProviderKey key, GatewayRequest request) {
     return adapters.stream()
         .filter(adapter -> adapter.supports(key, request))
         .findFirst()
@@ -52,8 +51,8 @@ public class ProviderRouter {
         .orElseGet(Mono::empty);
   }
 
-  private int routeScore(ProviderKey key, JsonNode request) {
-    String model = request.path("model").asText("");
+  private int routeScore(ProviderKey key, GatewayRequest request) {
+    String model = request.routingBody().path("model").asText("");
     int modelScore = 50;
     if (model.startsWith("claude-") && "ANTHROPIC".equalsIgnoreCase(key.provider())) modelScore = 0;
     if (model.startsWith("gpt-") && "OPENAI".equalsIgnoreCase(key.provider())) modelScore = 0;

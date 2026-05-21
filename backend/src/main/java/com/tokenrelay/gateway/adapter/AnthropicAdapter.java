@@ -1,17 +1,16 @@
 package com.tokenrelay.gateway.adapter;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.tokenrelay.gateway.domain.ProviderKey;
+import com.tokenrelay.gateway.proxy.GatewayOperation;
+import com.tokenrelay.gateway.proxy.GatewayRequest;
+import com.tokenrelay.gateway.proxy.ProviderProtocol;
+import com.tokenrelay.gateway.proxy.ProviderResponse;
 import java.net.URI;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
-import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 @Component
@@ -25,31 +24,26 @@ public class AnthropicAdapter implements ProviderAdapter {
   }
 
   @Override
-  public boolean supports(ProviderKey key, JsonNode request) {
-    String model = request.path("model").asText("");
+  public boolean supports(ProviderKey key, GatewayRequest request) {
+    if (request.operation() == GatewayOperation.EMBEDDINGS) {
+      return false;
+    }
+    String model = request.routingBody().path("model").asText("");
     return "ANTHROPIC".equalsIgnoreCase(key.provider()) || model.startsWith("claude-");
   }
 
   @Override
-  public Mono<ResponseEntity<Flux<String>>> stream(ProviderKey key, JsonNode request) {
-    ObjectNode body = objectMapper.createObjectNode();
-    body.set("model", request.path("model"));
-    body.set("messages", request.path("messages"));
-    body.put("stream", request.path("stream").asBoolean(false));
-    body.put("max_tokens", request.path("max_tokens").asInt(1024));
-    if (request.has("temperature")) {
-      body.set("temperature", request.path("temperature"));
-    }
-
+  public Mono<ProviderResponse> execute(ProviderKey key, GatewayRequest request) {
     return webClient.post()
         .uri(URI.create(trimSlash(key.baseUrl()) + "/v1/messages"))
         .header("x-api-key", key.apiKey())
         .header("anthropic-version", "2023-06-01")
         .contentType(MediaType.APPLICATION_JSON)
         .accept(MediaType.TEXT_EVENT_STREAM, MediaType.APPLICATION_JSON)
-        .body(BodyInserters.fromValue(body))
+        .body(BodyInserters.fromValue(request.anthropicMessagesBody()))
         .retrieve()
-        .toEntityFlux(String.class);
+        .toEntityFlux(String.class)
+        .map(response -> new ProviderResponse(ProviderProtocol.ANTHROPIC_MESSAGES, response));
   }
 
   private String trimSlash(String value) {

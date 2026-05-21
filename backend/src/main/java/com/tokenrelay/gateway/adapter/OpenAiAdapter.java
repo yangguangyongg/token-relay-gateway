@@ -4,14 +4,16 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.tokenrelay.gateway.domain.ProviderKey;
+import com.tokenrelay.gateway.proxy.GatewayOperation;
+import com.tokenrelay.gateway.proxy.GatewayRequest;
+import com.tokenrelay.gateway.proxy.ProviderProtocol;
+import com.tokenrelay.gateway.proxy.ProviderResponse;
 import java.net.URI;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
-import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 @Component
@@ -25,13 +27,24 @@ public class OpenAiAdapter implements ProviderAdapter {
   }
 
   @Override
-  public boolean supports(ProviderKey key, JsonNode request) {
+  public boolean supports(ProviderKey key, GatewayRequest request) {
     return "OPENAI".equalsIgnoreCase(key.provider());
   }
 
   @Override
-  public Mono<ResponseEntity<Flux<String>>> stream(ProviderKey key, JsonNode request) {
-    JsonNode body = withStreamUsageEnabled(request);
+  public Mono<ProviderResponse> execute(ProviderKey key, GatewayRequest request) {
+    if (request.operation() == GatewayOperation.EMBEDDINGS) {
+      return webClient.post()
+          .uri(URI.create(trimSlash(key.baseUrl()) + "/v1/embeddings"))
+          .header(HttpHeaders.AUTHORIZATION, "Bearer " + key.apiKey())
+          .contentType(MediaType.APPLICATION_JSON)
+          .accept(MediaType.APPLICATION_JSON)
+          .body(BodyInserters.fromValue(request.embeddingsBody()))
+          .retrieve()
+          .toEntityFlux(String.class)
+          .map(response -> new ProviderResponse(ProviderProtocol.EMBEDDINGS, response));
+    }
+    JsonNode body = withStreamUsageEnabled(request.chatCompletionsBody());
     return webClient.post()
         .uri(URI.create(trimSlash(key.baseUrl()) + "/v1/chat/completions"))
         .header(HttpHeaders.AUTHORIZATION, "Bearer " + key.apiKey())
@@ -39,7 +52,8 @@ public class OpenAiAdapter implements ProviderAdapter {
         .accept(MediaType.TEXT_EVENT_STREAM, MediaType.APPLICATION_NDJSON, MediaType.APPLICATION_JSON)
         .body(BodyInserters.fromValue(body))
         .retrieve()
-        .toEntityFlux(String.class);
+        .toEntityFlux(String.class)
+        .map(response -> new ProviderResponse(ProviderProtocol.CHAT_COMPLETIONS, response));
   }
 
   private JsonNode withStreamUsageEnabled(JsonNode request) {

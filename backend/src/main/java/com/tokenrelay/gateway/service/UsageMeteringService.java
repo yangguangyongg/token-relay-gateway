@@ -202,10 +202,14 @@ public class UsageMeteringService {
 
     private long estimatePromptTokens(JsonNode request) {
       JsonNode messages = request.path("messages");
-      if (messages.isMissingNode() || !messages.isArray()) {
-        return 1;
+      if (!messages.isMissingNode() && messages.isArray()) {
+        return Math.max(1, messages.toString().length() / 4L);
       }
-      return Math.max(1, messages.toString().length() / 4L);
+      JsonNode input = request.path("input");
+      if (!input.isMissingNode() && !input.isNull()) {
+        return Math.max(1, input.toString().length() / 4L);
+      }
+      return Math.max(1, request.toString().length() / 8L);
     }
 
     private long estimateCompletionTokens() {

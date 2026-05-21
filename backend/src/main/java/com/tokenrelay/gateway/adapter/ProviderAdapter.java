@@ -1,13 +1,12 @@
 package com.tokenrelay.gateway.adapter;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.tokenrelay.gateway.domain.ProviderKey;
-import org.springframework.http.ResponseEntity;
-import reactor.core.publisher.Flux;
+import com.tokenrelay.gateway.proxy.GatewayRequest;
+import com.tokenrelay.gateway.proxy.ProviderResponse;
 import reactor.core.publisher.Mono;
 
 public interface ProviderAdapter {
-  boolean supports(ProviderKey key, JsonNode request);
+  boolean supports(ProviderKey key, GatewayRequest request);
 
-  Mono<ResponseEntity<Flux<String>>> stream(ProviderKey key, JsonNode request);
+  Mono<ProviderResponse> execute(ProviderKey key, GatewayRequest request);
 }

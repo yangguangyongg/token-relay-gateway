@@ -29,11 +29,19 @@ public class AuthService {
 
   public Mono<AuthContext> authenticate(ServerWebExchange exchange) {
     String auth = exchange.getRequest().getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
-    if (auth == null || !auth.startsWith("Bearer ")) {
-      return Mono.error(new GatewayException(401, "missing_bearer_token", "Authorization: Bearer <gateway-api-key> is required"));
+    String token = null;
+    if (auth != null && auth.startsWith("Bearer ")) {
+      token = auth.substring("Bearer ".length()).trim();
     }
-
-    String token = auth.substring("Bearer ".length()).trim();
+    if (token == null || token.isBlank()) {
+      token = exchange.getRequest().getHeaders().getFirst("x-api-key");
+    }
+    if (token == null || token.isBlank()) {
+      return Mono.error(new GatewayException(
+          401,
+          "missing_api_key",
+          "Authorization: Bearer <gateway-api-key> or x-api-key is required"));
+    }
     return apiKeys.findByKeyHash(hashService.sha256(token))
         .switchIfEmpty(Mono.error(new GatewayException(401, "invalid_api_key", "Gateway API key is invalid")))
         .flatMap(apiKey -> {

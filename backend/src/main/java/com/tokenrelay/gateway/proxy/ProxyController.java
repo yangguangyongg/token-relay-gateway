@@ -11,8 +11,10 @@ import com.tokenrelay.gateway.service.ApiKeyPolicyService;
 import com.tokenrelay.gateway.service.AuthService;
 import com.tokenrelay.gateway.service.BillingControlService;
 import com.tokenrelay.gateway.service.ComplianceService;
+import com.tokenrelay.gateway.service.GatewayRequestFactory;
 import com.tokenrelay.gateway.service.GatewayException;
 import com.tokenrelay.gateway.service.ModelPricingService;
+import com.tokenrelay.gateway.service.ProtocolCompatibilityService;
 import com.tokenrelay.gateway.service.QuotaService;
 import com.tokenrelay.gateway.service.RateLimitService;
 import com.tokenrelay.gateway.service.UsageMeteringService;
@@ -21,14 +23,15 @@ import java.util.UUID;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -55,6 +58,8 @@ public class ProxyController {
   private final ModelPricingService modelPricingService;
   private final BillingControlService billingControlService;
   private final WorkspaceModelPolicyService workspaceModelPolicyService;
+  private final GatewayRequestFactory gatewayRequestFactory;
+  private final ProtocolCompatibilityService protocolCompatibilityService;
   private final ObjectMapper objectMapper;
   private final Duration providerTimeout;
 
@@ -71,6 +76,8 @@ public class ProxyController {
       ModelPricingService modelPricingService,
       BillingControlService billingControlService,
       WorkspaceModelPolicyService workspaceModelPolicyService,
+      GatewayRequestFactory gatewayRequestFactory,
+      ProtocolCompatibilityService protocolCompatibilityService,
       GatewayProperties gatewayProperties,
       ObjectMapper objectMapper) {
     this.authService = authService;
@@ -85,69 +92,93 @@ public class ProxyController {
     this.modelPricingService = modelPricingService;
     this.billingControlService = billingControlService;
     this.workspaceModelPolicyService = workspaceModelPolicyService;
+    this.gatewayRequestFactory = gatewayRequestFactory;
+    this.protocolCompatibilityService = protocolCompatibilityService;
     this.objectMapper = objectMapper;
     this.providerTimeout = gatewayProperties.providerTimeout();
   }
 
   @PostMapping(value = "/v1/chat/completions", produces = {MediaType.TEXT_EVENT_STREAM_VALUE, MediaType.APPLICATION_JSON_VALUE})
   public Mono<ResponseEntity<?>> chatCompletions(@RequestBody JsonNode request, ServerWebExchange exchange) {
+    return proxy(gatewayRequestFactory.chatCompletions(request), exchange);
+  }
+
+  @PostMapping(value = "/v1/responses", produces = {MediaType.TEXT_EVENT_STREAM_VALUE, MediaType.APPLICATION_JSON_VALUE})
+  public Mono<ResponseEntity<?>> responses(@RequestBody JsonNode request, ServerWebExchange exchange) {
+    return proxy(gatewayRequestFactory.responses(request), exchange);
+  }
+
+  @PostMapping(value = "/v1/embeddings", produces = MediaType.APPLICATION_JSON_VALUE)
+  public Mono<ResponseEntity<?>> embeddings(@RequestBody JsonNode request, ServerWebExchange exchange) {
+    return proxy(gatewayRequestFactory.embeddings(request), exchange);
+  }
+
+  @PostMapping(value = "/anthropic/v1/messages", produces = {MediaType.TEXT_EVENT_STREAM_VALUE, MediaType.APPLICATION_JSON_VALUE})
+  public Mono<ResponseEntity<?>> anthropicMessages(@RequestBody JsonNode request, ServerWebExchange exchange) {
+    return proxy(gatewayRequestFactory.anthropicMessages(request), exchange);
+  }
+
+  private Mono<ResponseEntity<?>> proxy(GatewayRequest gatewayRequest, ServerWebExchange exchange) {
     String requestId = UUID.randomUUID().toString();
     return authService.authenticate(exchange)
         .flatMap(context -> complianceService.check(exchange).thenReturn(context))
-        .flatMap(context -> apiKeyPolicyService.validate(context.apiKey(), request).thenReturn(context))
-        .flatMap(context -> workspaceModelPolicyService.validate(context.workspace().id(), request).thenReturn(context))
+        .flatMap(context -> apiKeyPolicyService.validate(context.apiKey(), gatewayRequest.routingBody()).thenReturn(context))
+        .flatMap(context -> workspaceModelPolicyService.validate(context.workspace().id(), gatewayRequest.routingBody()).thenReturn(context))
         .flatMap(context -> rateLimitService.check(context.apiKey()).thenReturn(context))
         .flatMap(context -> quotaService.reserve(context).thenReturn(context))
-        .flatMap(context -> routeWithFallback(context, request, requestId));
+        .flatMap(context -> routeWithFallback(context, gatewayRequest, requestId));
   }
 
-  private Mono<ResponseEntity<?>> routeWithFallback(AuthContext context, JsonNode request, String requestId) {
-    return router.candidates(context, request).flatMap(candidates -> {
+  private Mono<ResponseEntity<?>> routeWithFallback(AuthContext context, GatewayRequest gatewayRequest, String requestId) {
+    return router.candidates(context, gatewayRequest).flatMap(candidates -> {
       if (candidates.isEmpty()) {
         return Mono.error(new GatewayException(503, "no_provider", "No active provider key can serve this model"));
       }
-      return tryCandidate(context, request, requestId, candidates, 0);
+      return tryCandidate(context, gatewayRequest, requestId, candidates, 0);
     });
   }
 
   private Mono<ResponseEntity<?>> tryCandidate(
       AuthContext context,
-      JsonNode request,
+      GatewayRequest gatewayRequest,
       String requestId,
       List<ProviderRouter.RouteCandidate> candidates,
       int index) {
     ProviderRouter.RouteCandidate candidate = candidates.get(index);
-    UsageMeteringService.UsageTracker usageTracker = usageMeteringService.newTracker(candidate.providerKey().provider(), request);
-    boolean streaming = request.path("stream").asBoolean(false);
-    return candidate.adapter().stream(candidate.providerKey(), request)
+    UsageMeteringService.UsageTracker usageTracker =
+        usageMeteringService.newTracker(candidate.providerKey().provider(), gatewayRequest.routingBody());
+    return candidate.adapter().execute(candidate.providerKey(), gatewayRequest)
         .timeout(providerTimeout)
-        .flatMap(response -> streaming
-            ? Mono.just(buildStreamingResponse(context, candidate, request, requestId, response, usageTracker))
-            : buildNonStreamingResponse(context, candidate, request, requestId, response, usageTracker))
+        .flatMap(providerResponse -> gatewayRequest.stream()
+            ? Mono.just(buildStreamingResponse(context, candidate, gatewayRequest, requestId, providerResponse, usageTracker))
+            : buildNonStreamingResponse(context, candidate, gatewayRequest, requestId, providerResponse, usageTracker))
         .onErrorResume(error -> {
           if (index + 1 < candidates.size()) {
-            return tryCandidate(context, request, requestId, candidates, index + 1);
+            return tryCandidate(context, gatewayRequest, requestId, candidates, index + 1);
           }
           return Mono.error(mapProviderError(error));
         });
   }
 
-  private ResponseEntity<Flux<String>> buildStreamingResponse(
+  private ResponseEntity<?> buildStreamingResponse(
       AuthContext context,
       ProviderRouter.RouteCandidate candidate,
-      JsonNode request,
+      GatewayRequest gatewayRequest,
       String requestId,
-      ResponseEntity<Flux<String>> response,
+      ProviderResponse providerResponse,
       UsageMeteringService.UsageTracker usageTracker) {
     AtomicBoolean usageSaved = new AtomicBoolean(false);
-    Flux<String> body = response.getBody()
+    ResponseEntity<Flux<String>> response = providerResponse.response();
+    Flux<String> upstreamBody = response.getBody()
         .timeout(providerTimeout)
         .doOnNext(usageTracker::onChunk)
         .doOnCancel(() -> log.info(
             "Streaming client disconnected requestId={} provider={} workspaceId={}",
             requestId,
             candidate.providerKey().provider(),
-            context.workspace().id()))
+            context.workspace().id()));
+    Flux<String> body = protocolCompatibilityService
+        .transformStreaming(providerResponse.protocol(), gatewayRequest, upstreamBody)
         .doFinally(signal -> {
           if (signal == SignalType.CANCEL) {
             log.info(
@@ -159,30 +190,73 @@ public class ProxyController {
           persistUsageOnce(
               context,
               candidate,
-              request,
+              gatewayRequest.routingBody(),
               response.getStatusCode().value(),
               requestId,
               usageTracker,
               usageSaved,
               signal);
         });
-    return responseBuilder(
-            context,
-            candidate,
-            requestId,
-            response.getStatusCode().value(),
-            response.getHeaders().getContentType(),
-            MediaType.TEXT_EVENT_STREAM)
-        .body(body);
+    ResponseEntity.BodyBuilder builder = responseBuilder(
+        context,
+        candidate,
+        requestId,
+        response.getStatusCode().value(),
+        protocolCompatibilityService.responseContentType(gatewayRequest));
+    if (protocolCompatibilityService.requiresRawStreaming(providerResponse.protocol(), gatewayRequest)) {
+      return builder.body(toServerSentEvents(body));
+    }
+    return builder.body(body);
+  }
+
+  private Flux<ServerSentEvent<String>> toServerSentEvents(Flux<String> frames) {
+    return frames.concatMap(frame -> Flux.fromIterable(parseServerSentEvents(frame)));
+  }
+
+  private List<ServerSentEvent<String>> parseServerSentEvents(String frame) {
+    List<ServerSentEvent<String>> events = new ArrayList<>();
+    if (frame == null || frame.isBlank()) {
+      return events;
+    }
+    String normalized = frame.replace("\r\n", "\n");
+    for (String block : normalized.split("\n\n")) {
+      if (block.isBlank()) {
+        continue;
+      }
+      String eventName = null;
+      StringBuilder data = new StringBuilder();
+      for (String line : block.split("\n")) {
+        if (line.startsWith("event:")) {
+          eventName = line.substring("event:".length()).trim();
+        } else if (line.startsWith("data:")) {
+          if (data.length() > 0) {
+            data.append('\n');
+          }
+          data.append(line.substring("data:".length()).trim());
+        } else if (data.length() == 0) {
+          data.append(line.trim());
+        }
+      }
+      if (data.length() == 0) {
+        continue;
+      }
+      ServerSentEvent.Builder<String> builder = ServerSentEvent.builder(data.toString());
+      if (eventName != null && !eventName.isBlank()) {
+        builder.event(eventName);
+      }
+      events.add(builder.build());
+    }
+    return events;
   }
 
   private Mono<ResponseEntity<?>> buildNonStreamingResponse(
       AuthContext context,
       ProviderRouter.RouteCandidate candidate,
-      JsonNode request,
+      GatewayRequest gatewayRequest,
       String requestId,
-      ResponseEntity<Flux<String>> response,
+      ProviderResponse providerResponse,
       UsageMeteringService.UsageTracker usageTracker) {
+    ResponseEntity<Flux<String>> response = providerResponse.response();
     return response.getBody()
         .timeout(providerTimeout)
         .doOnNext(usageTracker::onChunk)
@@ -194,13 +268,15 @@ public class ProxyController {
                   candidate,
                   requestId,
                   response.getStatusCode().value(),
-                  response.getHeaders().getContentType(),
-                  MediaType.APPLICATION_JSON)
-              .body(decodeBody(bodyText));
+                  protocolCompatibilityService.responseContentType(gatewayRequest))
+              .body(protocolCompatibilityService.transformNonStreaming(
+                  providerResponse.protocol(),
+                  gatewayRequest,
+                  bodyText));
           return saveUsage(
                   context,
                   candidate,
-                  request,
+                  gatewayRequest.routingBody(),
                   response.getStatusCode().value(),
                   requestId,
                   usageTracker)
@@ -213,26 +289,13 @@ public class ProxyController {
       ProviderRouter.RouteCandidate candidate,
       String requestId,
       int statusCode,
-      MediaType providerContentType,
-      MediaType fallbackContentType) {
-    MediaType contentType = providerContentType == null ? fallbackContentType : providerContentType;
+      MediaType contentType) {
     return ResponseEntity.status(statusCode)
         .header("X-Request-Id", requestId)
         .header("X-Provider", candidate.providerKey().provider())
         .header("X-Provider-Scope", candidate.byokScope() ? "USER_BYOK" : "PLATFORM_SHARED")
         .header("X-Workspace-Id", context.workspace().id().toString())
         .contentType(contentType);
-  }
-
-  private Object decodeBody(String bodyText) {
-    if (bodyText == null || bodyText.isBlank()) {
-      return objectMapper.createObjectNode();
-    }
-    try {
-      return objectMapper.readTree(bodyText);
-    } catch (Exception ignored) {
-      return bodyText;
-    }
   }
 
   private void persistUsageOnce(

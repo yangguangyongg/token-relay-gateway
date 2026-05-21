@@ -18,7 +18,11 @@ docker compose up --build
 服务启动后：
 
 - Admin UI: http://localhost:8080
-- Gateway API: http://localhost:8080/v1/chat/completions
+- Gateway API:
+  - `http://localhost:8080/v1/chat/completions`
+  - `http://localhost:8080/v1/responses`
+  - `http://localhost:8080/v1/embeddings`
+  - `http://localhost:8080/anthropic/v1/messages`
 - Backend health: http://localhost:8080/api/health
 
 管理后台采用 `JWT + RBAC + IP 白名单`。请在 `.env` 中配置：
@@ -49,6 +53,14 @@ PROVIDER_KEY_ENCRYPTION_KEY=<base64-encoded 32-byte key>
 
 ```http
 Authorization: Bearer <gateway-api-key>
+X-Client-Region: NZ
+```
+
+Anthropic-compatible 客户端也可以使用：
+
+```http
+x-api-key: <gateway-api-key>
+anthropic-version: 2023-06-01
 X-Client-Region: NZ
 ```
 
@@ -161,6 +173,50 @@ curl -N http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+OpenAI-compatible Responses API:
+
+```bash
+curl http://localhost:8080/v1/responses \
+  -H "Authorization: Bearer demo-user-key" \
+  -H "X-Client-Region: NZ" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o-mini",
+    "stream": false,
+    "input": "Reply with exactly: responses-ok",
+    "max_output_tokens": 20
+  }'
+```
+
+OpenAI-compatible Embeddings:
+
+```bash
+curl http://localhost:8080/v1/embeddings \
+  -H "Authorization: Bearer demo-user-key" \
+  -H "X-Client-Region: NZ" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "text-embedding-3-small",
+    "input": "embedding smoke test"
+  }'
+```
+
+Anthropic-compatible Messages API:
+
+```bash
+curl http://localhost:8080/anthropic/v1/messages \
+  -H "x-api-key: demo-user-key" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "X-Client-Region: NZ" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o-mini",
+    "max_tokens": 20,
+    "stream": false,
+    "messages": [{"role": "user", "content": "Reply with exactly: anthropic-ok"}]
+  }'
+```
+
 ## 新用户接入流程（SOP）
 
 下面是当前版本可直接执行的一套接入流程，适用于你新增一个客户/团队成员。
@@ -218,8 +274,16 @@ curl -N http://localhost:8080/v1/chat/completions \
 
 ### BYOK 说明（当前版本）
 
-当前 `Provider Keys` 是平台级共享池，不是“按用户强隔离”的 BYOK。  
-如果你要做严格 BYOK（每个用户只能使用自己的 provider key），建议下一步给 `provider_keys` 增加 `user_id` 绑定，并在路由层按调用方用户过滤可用 provider keys。
+当前版本已经支持两种 provider key 归属：
+
+- 平台共享池：`ownerUserId = null`
+- 用户 BYOK：`ownerUserId = <user-id>`
+
+严格 BYOK 路由规则如下：
+
+1. 用户存在 `ACTIVE` 的自有 provider key 时，只使用该用户自己的 key 池。
+2. 用户不存在可用自有 key 时，回退到平台共享 key 池。
+3. 同一池内按模型匹配、健康状态和 `priority` 排序，并支持 fallback。
 
 ## MVP Coverage
 
@@ -239,7 +303,7 @@ curl -N http://localhost:8080/v1/chat/completions \
 - Region allow-list check
 - Redis fixed-window rate limiting
 - Monthly token quota reservation and usage counters
-- Request normalization for `/v1/chat/completions`
+- Protocol compatibility for `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, `/anthropic/v1/messages`
 - Provider routing by model prefix and priority
 - Fallback across OpenAI, Anthropic, Azure OpenAI, Gemini-compatible endpoints
 - Streaming and non-streaming proxy via Spring WebFlux
