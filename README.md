@@ -24,6 +24,8 @@ docker compose up --build
   - `http://localhost:8080/v1/embeddings`
   - `http://localhost:8080/anthropic/v1/messages`
 - Backend health: http://localhost:8080/api/health
+- Backend readiness: http://localhost:8080/actuator/health/readiness
+- Backend liveness: http://localhost:8080/actuator/health/liveness
 
 管理后台采用 `JWT + RBAC + IP 白名单`。请在 `.env` 中配置：
 
@@ -63,6 +65,48 @@ x-api-key: <gateway-api-key>
 anthropic-version: 2023-06-01
 X-Client-Region: NZ
 ```
+
+## 高可用与20并发优化（当前版本）
+
+已落地的关键优化项：
+
+- 后端连接池与生命周期：
+  - 启用 `R2DBC pool`（默认 `initial=10`, `max=40`）
+  - 启用 `graceful shutdown`，避免重启时中断请求
+- Provider 调用链路：
+  - `WebClient` 使用 Reactor Netty 连接池
+  - 可配置 `connect timeout`、`response timeout`、`pending acquire timeout`
+  - 降低高并发时连接争抢导致的请求堆积
+- Nginx 网关层：
+  - 提升 `worker_connections`
+  - 上游 keepalive 连接复用
+  - 对 streaming 路径关闭代理缓冲，降低流式延迟
+- 可观测性与探针：
+  - 暴露 `/actuator/health/liveness` 与 `/actuator/health/readiness`
+  - 可直接用于 AWS ALB target health check
+
+可配置参数（`.env`）：
+
+- `R2DBC_POOL_INITIAL_SIZE`
+- `R2DBC_POOL_MAX_SIZE`
+- `PROVIDER_RESPONSE_TIMEOUT_SECONDS`
+- `PROVIDER_HTTP_MAX_CONNECTIONS`
+- `PROVIDER_HTTP_PENDING_ACQUIRE_MAX_COUNT`
+- `PROVIDER_HTTP_PENDING_ACQUIRE_TIMEOUT_MILLIS`
+- `PROVIDER_HTTP_CONNECT_TIMEOUT_MILLIS`
+- `PROVIDER_HTTP_IDLE_TIMEOUT_SECONDS`
+
+并发压测脚本：
+
+```bash
+./scripts/load_test_20_concurrency.sh http://localhost:8080/api/health 200 20
+```
+
+## AWS 部署准备（明日可执行）
+
+完整清单见：
+
+- [docs/aws-deployment-checklist.md](/Users/yangguangyong/Documents/Token中转站/docs/aws-deployment-checklist.md)
 
 ## Provider 管理与 BYOK
 

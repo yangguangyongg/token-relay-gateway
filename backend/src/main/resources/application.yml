@@ -1,13 +1,26 @@
 server:
   port: 8080
+  shutdown: graceful
+  compression:
+    enabled: true
+    min-response-size: 2KB
+    mime-types: application/json,text/plain,text/html,text/css,application/javascript
 
 spring:
   application:
     name: token-relay-gateway
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
   r2dbc:
     url: ${DATABASE_URL:r2dbc:postgresql://localhost:5432/token_gateway}
     username: ${POSTGRES_USER:token_gateway}
     password: ${POSTGRES_PASSWORD:token_gateway}
+    pool:
+      enabled: true
+      initial-size: ${R2DBC_POOL_INITIAL_SIZE:10}
+      max-size: ${R2DBC_POOL_MAX_SIZE:40}
+      max-idle-time: 30m
+      validation-query: SELECT 1
   flyway:
     enabled: true
     url: ${FLYWAY_URL:jdbc:postgresql://localhost:5432/token_gateway}
@@ -17,6 +30,24 @@ spring:
     redis:
       host: ${REDIS_HOST:localhost}
       port: ${REDIS_PORT:6379}
+  codec:
+    max-in-memory-size: 10MB
+
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true
 
 gateway:
   admin-api-key: ${ADMIN_API_KEY:change-me-admin-key}
@@ -31,5 +62,10 @@ gateway:
   admin-ip-whitelist: ${ADMIN_IP_WHITELIST:127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
   allowed-regions: ${ALLOWED_REGIONS:NZ,AU,US,CA,GB,IE,JP,KR,SG,IN,DE,FR,NL,SE,NO,DK,FI}
   cors-allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173,http://localhost:8080}
-  default-provider-timeout-seconds: 120
+  default-provider-timeout-seconds: ${PROVIDER_RESPONSE_TIMEOUT_SECONDS:120}
+  provider-http-max-connections: ${PROVIDER_HTTP_MAX_CONNECTIONS:200}
+  provider-http-pending-acquire-max-count: ${PROVIDER_HTTP_PENDING_ACQUIRE_MAX_COUNT:1000}
+  provider-http-pending-acquire-timeout-millis: ${PROVIDER_HTTP_PENDING_ACQUIRE_TIMEOUT_MILLIS:3000}
+  provider-http-connect-timeout-millis: ${PROVIDER_HTTP_CONNECT_TIMEOUT_MILLIS:3000}
+  provider-http-idle-timeout-seconds: ${PROVIDER_HTTP_IDLE_TIMEOUT_SECONDS:60}
   provider-key-encryption-key: ${PROVIDER_KEY_ENCRYPTION_KEY:REPLACE_WITH_32_BYTE_BASE64_KEY}

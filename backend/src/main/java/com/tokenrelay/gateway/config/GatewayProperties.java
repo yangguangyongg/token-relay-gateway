@@ -19,6 +19,11 @@ public record GatewayProperties(
     List<String> allowedRegions,
     List<String> corsAllowedOrigins,
     long defaultProviderTimeoutSeconds,
+    int providerHttpMaxConnections,
+    int providerHttpPendingAcquireMaxCount,
+    long providerHttpPendingAcquireTimeoutMillis,
+    int providerHttpConnectTimeoutMillis,
+    long providerHttpIdleTimeoutSeconds,
     String providerKeyEncryptionKey) {
 
   public Duration providerTimeout() {
@@ -31,5 +36,25 @@ public record GatewayProperties(
 
   public Duration workspaceJwtTtl() {
     return Duration.ofSeconds(workspaceJwtTtlSeconds <= 0 ? 86400 : workspaceJwtTtlSeconds);
+  }
+
+  public int providerHttpMaxConnectionsSafe() {
+    return providerHttpMaxConnections <= 0 ? 200 : providerHttpMaxConnections;
+  }
+
+  public int providerHttpPendingAcquireMaxCountSafe() {
+    return providerHttpPendingAcquireMaxCount <= 0 ? 1000 : providerHttpPendingAcquireMaxCount;
+  }
+
+  public Duration providerHttpPendingAcquireTimeout() {
+    return Duration.ofMillis(providerHttpPendingAcquireTimeoutMillis <= 0 ? 3000 : providerHttpPendingAcquireTimeoutMillis);
+  }
+
+  public int providerHttpConnectTimeoutMillisSafe() {
+    return providerHttpConnectTimeoutMillis <= 0 ? 3000 : providerHttpConnectTimeoutMillis;
+  }
+
+  public Duration providerHttpIdleTimeout() {
+    return Duration.ofSeconds(providerHttpIdleTimeoutSeconds <= 0 ? 60 : providerHttpIdleTimeoutSeconds);
   }
 }

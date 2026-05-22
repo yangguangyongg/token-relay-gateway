@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-token_gateway}
       POSTGRES_USER: ${POSTGRES_USER:-token_gateway}
@@ -17,6 +18,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports:
       - "6379:6379"
     healthcheck:
@@ -28,6 +30,7 @@ services:
   backend:
     build:
       context: ./backend
+    restart: unless-stopped
     environment:
       DATABASE_URL: ${DATABASE_URL:-r2dbc:postgresql://postgres:5432/token_gateway}
       FLYWAY_URL: ${FLYWAY_URL:-jdbc:postgresql://postgres:5432/token_gateway}
@@ -35,6 +38,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-token_gateway}
       REDIS_HOST: ${REDIS_HOST:-redis}
       REDIS_PORT: ${REDIS_PORT:-6379}
+      R2DBC_POOL_INITIAL_SIZE: ${R2DBC_POOL_INITIAL_SIZE:-10}
+      R2DBC_POOL_MAX_SIZE: ${R2DBC_POOL_MAX_SIZE:-40}
       ADMIN_API_KEY: ${ADMIN_API_KEY:-change-me-admin-key}
       ADMIN_JWT_SECRET: ${ADMIN_JWT_SECRET:-REPLACE_WITH_32_BYTE_BASE64_JWT_SECRET}
       ADMIN_JWT_TTL_SECONDS: ${ADMIN_JWT_TTL_SECONDS:-3600}
@@ -48,6 +53,13 @@ services:
       PROVIDER_KEY_ENCRYPTION_KEY: ${PROVIDER_KEY_ENCRYPTION_KEY:-REPLACE_WITH_32_BYTE_BASE64_KEY}
       ALLOWED_REGIONS: ${ALLOWED_REGIONS:-NZ,AU,US,CA,GB,IE,JP,KR,SG,IN,DE,FR,NL,SE,NO,DK,FI}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:8080}
+      PROVIDER_RESPONSE_TIMEOUT_SECONDS: ${PROVIDER_RESPONSE_TIMEOUT_SECONDS:-120}
+      PROVIDER_HTTP_MAX_CONNECTIONS: ${PROVIDER_HTTP_MAX_CONNECTIONS:-200}
+      PROVIDER_HTTP_PENDING_ACQUIRE_MAX_COUNT: ${PROVIDER_HTTP_PENDING_ACQUIRE_MAX_COUNT:-1000}
+      PROVIDER_HTTP_PENDING_ACQUIRE_TIMEOUT_MILLIS: ${PROVIDER_HTTP_PENDING_ACQUIRE_TIMEOUT_MILLIS:-3000}
+      PROVIDER_HTTP_CONNECT_TIMEOUT_MILLIS: ${PROVIDER_HTTP_CONNECT_TIMEOUT_MILLIS:-3000}
+      PROVIDER_HTTP_IDLE_TIMEOUT_SECONDS: ${PROVIDER_HTTP_IDLE_TIMEOUT_SECONDS:-60}
+      JAVA_TOOL_OPTIONS: ${JAVA_TOOL_OPTIONS:--XX:+UseContainerSupport -XX:MaxRAMPercentage=70 -XX:+ExitOnOutOfMemoryError}
     depends_on:
       postgres:
         condition: service_healthy
@@ -57,11 +69,13 @@ services:
   frontend:
     build:
       context: ./frontend
+    restart: unless-stopped
     depends_on:
       - backend
 
   nginx:
     image: nginx:1.27-alpine
+    restart: unless-stopped
     ports:
       - "8080:80"
     volumes:
